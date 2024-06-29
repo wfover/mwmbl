@@ -1,6 +1,9 @@
 {%  load humanize %}
 {%  include "title.html" %}
-<p>Welcome to Mwmbl! Please read the <a href="https://book.mwmbl.org/page/curating/">guidelines</a> before editing results.</p>
+<p>Welcome to Mwmbl! Feel free to <a href="{% url "submit_domain" %}">submit</a> a site to crawl.
+  Please read the <a href="https://book.mwmbl.org/page/curating/">guidelines</a> before editing results.</p>
+<p>To contribute to the index you can get our Firefox Extension <a href="https://addons.mozilla.org/en-GB/firefox/addon/mwmbl-web-crawler/">here</a>.
+For recent crawling activity see <a href="/stats">stats</a>.</p>
 <br>
 <div is="mwmbl-add-result" style="display: none">
   <form class="modal-content"
@@ -43,14 +46,11 @@
     </ul>
   {% endif %}
 {% else %}
+  <h1>Recent community activity</h1>
+  <br>
   {%  for item in activity %}
-    <ul>
-      <li class="activity">
-        <h1>
-          {% if item.user %}{{ item.user }}{% else %}Anonymous{% endif %} made <a href="{% url 'curation' item.id %}">{{ item.num_changes | apnumber }}
-          changes to {{ item.query }}</a> {{ item.timestamp | naturaltime }}.
-        </h1>
-      </li>
-    </ul>
+    {% include "curation_item.html" %}
   {% endfor %}
+  <br>
+  <a href="{% url "curations" %}">All curations</a>
 {% endif %}
