@@ -49,10 +49,12 @@ from mwmbl.tinysearchengine.mmr_rank import mmr_rerank
 from mwmbl.tinysearchengine.rank import score_result_whole
 from mwmbl.tinysearchengine.super_search_sources import SOURCES
 from mwmbl.tinysearchengine.super_search_select import bandit as ss_bandit
+from mwmbl.tinysearchengine.super_search_select import judge as ss_judge
 from mwmbl.tinysearchengine.super_search_select import profiles as ss_profiles
 from mwmbl.tinysearchengine.super_search_select.policy import select_sources
 from mwmbl.tinysearchengine.super_search_select.rewards import (
     SelectionContext,
+    compute_judge_rewards,
     compute_rewards,
     log_impression,
     record_source_provenance,
@@ -435,9 +437,17 @@ async def _follow_links(
     await _emit_final_results(query, all_docs, emit, last_results_key, lock, ctx)
 
 
+def _judge_score_docs(query: str, docs: list[Document]) -> list[float] | None:
+    """Score docs with the fine-tuned relevance judge; None if it is unavailable."""
+    judge = ss_judge.get_judge()
+    if judge is None:
+        return None
+    return judge.score(query, [ss_judge.doc_text(d.title, d.extract) for d in docs])
+
+
 async def _emit_final_results(
     query: str, all_docs: list[Document], emit, last_results_key: list, lock: asyncio.Lock,
-    ctx: SelectionContext,
+    ctx: SelectionContext, use_judge: bool = False,
 ) -> None:
     terms = tokenize(query)
     final_limit = getattr(settings, "SUPER_SEARCH_FINAL_RESULTS_LIMIT", 100)
@@ -460,7 +470,17 @@ async def _emit_final_results(
         if not unique:
             return
 
-        final_scores = await asyncio.to_thread(score_documents, ltr_model, query, unique)
+        # The end-of-search frame is re-ranked by the fine-tuned relevance
+        # judge when available (the LTR model anti-correlates with human
+        # curation — see devdata/judge_train/RESULTS.md); the per-URL judge
+        # scores double as the bandit's per-source reward signal.
+        final_scores = None
+        if use_judge:
+            final_scores = await asyncio.to_thread(_judge_score_docs, query, unique)
+            if final_scores is not None:
+                ctx.judge_scores = dict(zip((doc.url for doc in unique), final_scores))
+        if final_scores is None:
+            final_scores = await asyncio.to_thread(score_documents, ltr_model, query, unique)
         ranked = sorted(zip(unique, final_scores), key=lambda x: -x[1])[:final_limit]
         # Diversify with MMR (demotes, never drops, same-domain / near-duplicate
         # results) to match standard search — see MMRRanker in search_setup.py.
@@ -515,12 +535,19 @@ def _enqueue_discovered_urls(ctx: SelectionContext) -> None:
 
 
 async def _record_rewards(query: str, ctx: SelectionContext, last_results_key: list) -> None:
-    """Compute implicit per-source rewards from the final top-K and log the impression."""
+    """Compute per-source rewards and log the impression.
+
+    Preferred reward: mean relevance-judge score of each source's final-pool
+    documents (recorded by the judged final re-rank). Fallback when the judge
+    is unavailable: fraction of a source's results surviving the final top-K.
+    """
     if not ctx.selected:
         return
-    final_urls = list(last_results_key[0] or ())
-    top_k = getattr(settings, "SUPER_SEARCH_TOP_K", 10)
-    rewards = compute_rewards(ctx, final_urls[:top_k])
+    rewards = compute_judge_rewards(ctx)
+    if rewards is None:
+        final_urls = list(last_results_key[0] or ())
+        top_k = getattr(settings, "SUPER_SEARCH_TOP_K", 10)
+        rewards = compute_rewards(ctx, final_urls[:top_k])
     try:
         await asyncio.to_thread(log_impression, query, ctx, rewards)
     except Exception:
@@ -665,7 +692,8 @@ async def _sse_stream(query: str, monthly_usage: int, monthly_limit: int):
         finally:
             if reason in ("complete", "timed_out"):
                 try:
-                    await _emit_final_results(query, all_docs, emit, last_results_key, results_lock, selection_ctx)
+                    await _emit_final_results(query, all_docs, emit, last_results_key,
+                                              results_lock, selection_ctx, use_judge=True)
                 except Exception:
                     logger.exception("super-search failed to emit final results")
                 pages_indexed = await _index_results(query, all_docs)
@@ -734,7 +762,7 @@ def init_router() -> None:
             "| `result_promoted` | result item (`origin=\"direct\"`) | A result entered the live top-K and will have its outbound links followed. |\n"
             "| `page_fetched` | `{url, links}` | A promoted page was crawled; `links` is the number of outbound links found. |\n"
             "| `link_followed` | `{url, from}` | An outbound link from a crawled page was fetched and added to the candidate pool. |\n"
-            "| `results` | `{results[], count}` | The current authoritative ranking (items have `origin=\"final\"`). Emitted progressively after each source and once more at the end — **replace** your displayed list on each. |\n"
+            "| `results` | `{results[], count}` | The current authoritative ranking (items have `origin=\"final\"`). Emitted progressively after each source and once more at the end; the end-of-search frame is re-ranked by the fine-tuned relevance judge when available — **replace** your displayed list on each. |\n"
             "| `error` | `{message}` | The pipeline crashed; the stream ends. |\n"
             "| `done` | `{reason, elapsed_seconds, monthly_usage, monthly_limit, pages_indexed}` | Terminal event. `reason` is `complete`, `timed_out`, `cancelled` or `error`; `pages_indexed` is the number of new pages added to the Mwmbl index by this search. |\n\n"
             "The exact JSON shape of every payload is given by the `oneOf` schema "

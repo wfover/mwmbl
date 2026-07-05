@@ -1,11 +1,14 @@
 """Implicit reward and impression logging for source selection.
 
-The reward for a queried source is the fraction of its results that survive into
-the final LTR-ranked top-K — a self-contained "did this source contribute"
-signal needing no click logging. ``SelectionContext`` carries the per-request
-state (which sources were selected, and which URL came from which source) from
-the pipeline to the completion hook, where ``compute_rewards`` and
-``log_impression`` run.
+The preferred reward for a queried source is the mean relevance-judge score of
+the documents it contributed to the final pool (``compute_judge_rewards``; see
+super_search_select/judge.py) — an independent signal validated against LLM
+labels and human curations. When the judge is unavailable the fallback is the
+original survival reward: the fraction of a source's results in the final
+LTR-ranked top-K (``compute_rewards``). ``SelectionContext`` carries the
+per-request state (which sources were selected, which URL came from which
+source, and the judge scores from the final re-rank) from the pipeline to the
+completion hook, where reward computation and ``log_impression`` run.
 """
 from __future__ import annotations
 
@@ -24,6 +27,7 @@ class SelectionContext:
     selected: list[str] = field(default_factory=list)     # sources actually queried
     source_by_url: dict[str, str] = field(default_factory=dict)  # url -> originating source
     features: dict[str, list[float]] = field(default_factory=dict)  # source -> feature vector
+    judge_scores: dict[str, float] = field(default_factory=dict)  # url -> judge score (final pool)
     per_source_limit: int = 0
 
     def record_results(self, source: str, urls: list[str]) -> None:
@@ -46,6 +50,29 @@ def compute_rewards(ctx: SelectionContext, final_top_k_urls: list[str]) -> dict[
         if source in rewards:
             rewards[source] += 1.0 / limit
     return {name: min(r, 1.0) for name, r in rewards.items()}
+
+
+def compute_judge_rewards(ctx: SelectionContext) -> dict[str, float] | None:
+    """Reward per selected source = mean judge score of its final-pool documents.
+
+    Uses the per-URL relevance-judge scores recorded during the final re-rank
+    (``ctx.judge_scores``). The mean over a source's contributed documents is
+    the aggregate the judge was validated on (source-level agreement in the
+    bake-off). Every selected source gets an entry — 0.0 when nothing it
+    returned reached the final pool, since the bandit needs the zeros too.
+    Returns None when no judge scores exist (judge unavailable or no results);
+    callers fall back to ``compute_rewards``.
+    """
+    if not ctx.judge_scores:
+        return None
+    totals = {name: [0.0, 0] for name in ctx.selected}
+    for url, score in ctx.judge_scores.items():
+        source = ctx.source_by_url.get(url)
+        if source in totals:
+            totals[source][0] += score
+            totals[source][1] += 1
+    return {name: total / count if count else 0.0
+            for name, (total, count) in totals.items()}
 
 
 def log_impression(query: str, ctx: SelectionContext, rewards: dict[str, float]) -> None:

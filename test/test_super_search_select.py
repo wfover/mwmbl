@@ -169,6 +169,29 @@ def test_record_results_first_source_wins():
     assert ctx.source_by_url["shared"] == "a"
 
 
+def test_compute_judge_rewards_mean_per_source():
+    ctx = SelectionContext(selected=["a", "b", "c"])
+    ctx.record_results("a", ["u1", "u2"])
+    ctx.record_results("b", ["u3"])
+    # c returned nothing; u2 never reached the final pool so has no score
+    ctx.judge_scores = {"u1": 0.8, "u3": 0.4}
+    r = rewards.compute_judge_rewards(ctx)
+    assert r == {"a": pytest.approx(0.8), "b": pytest.approx(0.4), "c": 0.0}
+
+
+def test_compute_judge_rewards_averages_multiple_docs():
+    ctx = SelectionContext(selected=["a"])
+    ctx.record_results("a", ["u1", "u2"])
+    ctx.judge_scores = {"u1": 1.0, "u2": 0.0}
+    assert rewards.compute_judge_rewards(ctx) == {"a": pytest.approx(0.5)}
+
+
+def test_compute_judge_rewards_none_without_scores():
+    ctx = SelectionContext(selected=["a"])
+    ctx.record_results("a", ["u1"])
+    assert rewards.compute_judge_rewards(ctx) is None
+
+
 def test_log_impression_noop_without_database(monkeypatch):
     monkeypatch.setattr("django.conf.settings.HAS_DATABASE", False)
     # Should not raise even though no DB is configured.

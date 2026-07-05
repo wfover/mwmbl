@@ -51,6 +51,8 @@ dependencies = [
     # Used by the Super Search recipe engine (super_search_sources/recipe.py),
     # which is imported at app startup — must be a core dep, not indexer-only.
     "beautifulsoup4==4.10.0",
+    "onnxruntime>=1.27.0",
+    "tokenizers>=0.23.1",
 ]
 
 [project.optional-dependencies]

@@ -288,6 +288,13 @@ SUPER_SEARCH_MAX_LINKS_PER_PAGE = 3
 SUPER_SEARCH_RESULTS_PER_SOURCE = 10
 SUPER_SEARCH_FINAL_RESULTS_LIMIT = 100
 SUPER_SEARCH_CRAWL_WORKERS = 8   # threads in the dedicated crawl pool
+# Fine-tuned relevance judge (dir with model.onnx + tokenizer.json; see
+# devdata/judge_train/RESULTS.md). If the artifact is missing, Super Search
+# falls back to LTR final ranking and top-K-survival bandit rewards.
+SUPER_SEARCH_JUDGE_MODEL_DIR = os.environ.get(
+    "SUPER_SEARCH_JUDGE_MODEL_DIR",
+    str(Path(__file__).parent.parent / "devdata" / "judge_train" / "models"
+        / "minilm-both-v1" / "onnx"))
 
 # Super Search source selection (bandit / cosine profiles)
 SUPER_SEARCH_SOURCES_TO_QUERY = 10   # max sources queried per search
