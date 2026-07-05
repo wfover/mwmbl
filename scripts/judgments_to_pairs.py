@@ -15,6 +15,8 @@ Noise filters (applied before any pair derivation):
   events of which a single domain accounts for > SPAM_DOMAIN_SHARE (this
   catches the 12bytes.org mass-injector in the old table and the twitter.com
   single-query flooder in the new one, without hardcoding user ids);
+- curations whose query is itself a URL/domain are dropped (the self-promotion
+  add signature: search your own URL, add it);
 - no-op curations (identical URL order) contribute nothing.
 
 Pair derivation:
@@ -59,6 +61,16 @@ def domain(url: str) -> str:
         return urlparse(url).netloc.lower()
     except ValueError:
         return ""
+
+
+URLISH_RE = re.compile(r"[a-z0-9-]+(\.[a-z0-9-]+)+(/\S*)?")
+
+
+def is_urlish_query(query: str) -> bool:
+    """A query that is itself a URL/domain — the self-promotion add signature
+    (search your own URL, add it), and useless as judge-training input."""
+    query = query.strip().lower()
+    return query.startswith("http") or "://" in query or bool(URLISH_RE.fullmatch(query))
 
 
 def query_from_results_url(url: str) -> str | None:
@@ -321,7 +333,9 @@ def main():
     pointwise: list[dict] = []
     report = {"dropped_users": len(dropped_users), "spammer_domains": spammers}
 
-    kept = [c for c in curations if c["user"] not in dropped_users]
+    kept = [c for c in curations
+            if c["user"] not in dropped_users and not is_urlish_query(c["query"])]
+    urlish = sum(1 for c in curations if is_urlish_query(c["query"]))
     no_ops = 0
     for curation in kept:
         if [d["url"] for d in curation["original_results"]] == \
@@ -329,14 +343,17 @@ def main():
             no_ops += 1
             continue
         pairs_from_curation(curation, emitter)
-    report["curations"] = {"total": len(curations), "kept": len(kept), "no_ops": no_ops}
+    report["curations"] = {"total": len(curations), "kept": len(kept),
+                           "urlish_queries": urlish, "no_ops": no_ops}
 
-    kept_events = [e for e in user_curations if e["user"] not in dropped_users]
+    kept_events = [e for e in user_curations
+                   if e["user"] not in dropped_users
+                   and not (e["query"] and is_urlish_query(e["query"]))]
     pairs_from_user_curations(kept_events, emitter, pointwise)
     report["user_curations"] = {"total": len(user_curations), "kept": len(kept_events)}
 
     for vote in votes:
-        if vote["user"] in dropped_users:
+        if vote["user"] in dropped_users or is_urlish_query(vote["query"]):
             continue
         filled = lookup.fill({"url": vote["url"], "title": None, "extract": None})
         pointwise.append({"query": vote["query"], **slim(filled),
