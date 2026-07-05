@@ -65,6 +65,19 @@ def domain(url: str) -> str:
 
 URLISH_RE = re.compile(r"[a-z0-9-]+(\.[a-z0-9-]+)+(/\S*)?")
 
+# No-NSFW policy: pairs touching adult content are excluded from training data.
+# Word-boundary matching so e.g. Essex/Sussex don't trip the "sex" term.
+NSFW_RE = re.compile(
+    r"\b(porn\w*|xxx+|hentai|milfs?|nsfw|xvideos?|xhamster|redtube|youporn|"
+    r"brazzers|onlyfans|camgirls?|camsex|livejasmin|chaturbate|stripchat|"
+    r"erotic\w*|escorts?|sex|sexcam\w*|blowjob\w*|anal|cumshot\w*|gangbang\w*|"
+    r"nudes?|naked|fetish\w*|bdsm|dildos?|masturbat\w*)\b",
+    re.IGNORECASE)
+
+
+def is_nsfw(*texts) -> bool:
+    return any(NSFW_RE.search(t) for t in texts if t)
+
 
 def is_urlish_query(query: str) -> bool:
     """A query that is itself a URL/domain — the self-promotion add signature
@@ -149,8 +162,14 @@ class PairEmitter:
         self.rule_counts = Counter()
 
     def emit(self, query: str, pos: dict, negs: list[dict], rule: str, table: str, user):
+        if is_nsfw(query, pos.get("url"), pos.get("title"), pos.get("extract")):
+            self.rule_counts["nsfw_dropped"] += 1
+            return
         for neg in negs[:PAIR_CAP]:
             if pos["url"] == neg["url"]:
+                continue
+            if is_nsfw(neg.get("url"), neg.get("title"), neg.get("extract")):
+                self.rule_counts["nsfw_dropped"] += 1
                 continue
             key = (query, pos["url"], neg["url"])
             if key in self.seen:
@@ -222,6 +241,8 @@ def pairs_from_user_curations(events: list[dict], emitter: PairEmitter, pointwis
             index = action.get("validate_index")
             if action.get("is_validated") and index is not None and 0 <= index < len(results):
                 doc = slim(emitter.lookup.fill(results[index]))
+                if is_nsfw(query, doc["url"], doc["title"], doc["extract"]):
+                    continue
                 pointwise.append({"query": query, **doc, "label": 1,
                                   "rule": "validate", "table": "user_curations", "user": user})
 
@@ -356,6 +377,8 @@ def main():
         if vote["user"] in dropped_users or is_urlish_query(vote["query"]):
             continue
         filled = lookup.fill({"url": vote["url"], "title": None, "extract": None})
+        if is_nsfw(vote["query"], vote["url"], filled.get("title"), filled.get("extract")):
+            continue
         pointwise.append({"query": vote["query"], **slim(filled),
                           "label": 1 if vote["vote_type"] == "upvote" else -1,
                           "rule": "vote", "table": "votes", "user": vote["user"]})
