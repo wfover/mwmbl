@@ -6,7 +6,7 @@ import pytest
 from django.contrib.auth import get_user_model
 from django.core.management import call_command
 
-from mwmbl.models import Curation, FlagCuration, SearchResultVote, UserCuration
+from mwmbl.models import Curation, DomainSubmission, FlagCuration, SearchResultVote, UserCuration
 
 User = get_user_model()
 
@@ -53,11 +53,14 @@ def test_export_writes_sanitized_records(tmp_path, user, flagger, curation):
     )
     SearchResultVote.objects.create(
         user=user, url="https://a.com", query="test query", vote_type="upvote")
+    DomainSubmission.objects.create(
+        name="spammy.example.com", submitted_by=user, status="REJECTED",
+        status_changed_by=flagger, rejection_reason="SPAM", rejection_detail="link farm")
 
     call_command("export_judgments", output_dir=str(tmp_path))
 
     records = {}
-    for name in ("curations", "user_curations", "votes"):
+    for name in ("curations", "user_curations", "votes", "domains"):
         with gzip.open(tmp_path / f"{name}.jsonl.gz", "rt") as f:
             records[name] = [json.loads(line) for line in f]
 
@@ -82,11 +85,21 @@ def test_export_writes_sanitized_records(tmp_path, user, flagger, curation):
     assert vote["vote_type"] == "upvote"
     assert vote["user"] == exported["user"]
 
+    [domain] = records["domains"]
+    assert domain["domain"] == "spammy.example.com"
+    assert domain["status"] == "REJECTED"
+    assert domain["rejection_reason"] == "SPAM"
+    assert domain["user"] == exported["user"]
+    # the reviewing moderator's identity is not exported
+    assert "flagger" not in json.dumps(records)
+
     stats = json.loads((tmp_path / "stats.json").read_text())
     assert stats["curations"]["count"] == 1
     assert stats["curations"]["flag_status_counts"] == {"ACCEPTED": 1}
     assert stats["user_curations"]["curation_type_counts"] == {"curate_delete": 1}
     assert stats["votes"]["vote_type_counts"] == {"upvote": 1}
+    assert stats["domains"]["status_counts"] == {"REJECTED": 1}
+    assert stats["domains"]["rejection_reason_counts"] == {"SPAM": 1}
     assert stats["users"]["distinct_users"] == 1
 
 

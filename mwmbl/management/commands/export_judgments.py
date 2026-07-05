@@ -9,6 +9,8 @@ Dumps three gzipped JSONL files plus a stats summary to an output directory:
 - ``user_curations.jsonl.gz`` one record per UserCuration action event (old
   interface): move/delete/add/validate with the result list at that point.
 - ``votes.jsonl.gz``         one record per SearchResultVote (query, url, ±).
+- ``domains.jsonl.gz``       one record per DomainSubmission: a human label at
+  domain granularity (REJECTED/SPAM = junk domain, APPROVED = acceptable).
 - ``stats.json``             counts and distributions, also printed, so a
   ``--stats-only`` run works as a data health check before exporting.
 
@@ -26,7 +28,7 @@ from urllib.parse import parse_qs, urlparse
 from django.core.management.base import BaseCommand
 from django.utils.dateparse import parse_date
 
-from mwmbl.models import Curation, FlagCuration, SearchResultVote, UserCuration
+from mwmbl.models import Curation, DomainSubmission, FlagCuration, SearchResultVote, UserCuration
 
 DOCUMENT_FIELDS = ("url", "title", "extract", "score", "state")
 
@@ -77,13 +79,14 @@ class Command(BaseCommand):
         writers = {}
         if not stats_only:
             output_dir.mkdir(parents=True, exist_ok=True)
-            for name in ("curations", "user_curations", "votes"):
+            for name in ("curations", "user_curations", "votes", "domains"):
                 writers[name] = gzip.open(output_dir / f"{name}.jsonl.gz", "wt")
 
         try:
             stats["curations"] = self.export_curations(writers.get("curations"), anon, since)
             stats["user_curations"] = self.export_user_curations(writers.get("user_curations"), anon, since)
             stats["votes"] = self.export_votes(writers.get("votes"), anon, since)
+            stats["domains"] = self.export_domains(writers.get("domains"), anon, since)
         finally:
             for writer in writers.values():
                 writer.close()
@@ -233,6 +236,45 @@ class Command(BaseCommand):
             "distinct_queries": len(queries),
             "distinct_urls": len(urls),
             "vote_type_counts": dict(vote_type_counts),
+            "timestamp_range": timestamps.range(),
+        }
+
+
+    def export_domains(self, writer, anon, since):
+        queryset = DomainSubmission.objects.order_by("id")
+        if since:
+            queryset = queryset.filter(submitted_on__date__gte=since)
+
+        count = 0
+        status_counts = Counter()
+        rejection_reason_counts = Counter()
+        domains = set()
+        timestamps = MinMax()
+
+        for submission in queryset.iterator():
+            record = {
+                "domain": submission.name,
+                "user": anon.get(submission.submitted_by_id),
+                "timestamp": submission.submitted_on.isoformat() if submission.submitted_on else None,
+                "status": submission.status,
+                "rejection_reason": submission.rejection_reason or None,
+                "rejection_detail": submission.rejection_detail or None,
+            }
+            if writer:
+                writer.write(json.dumps(record) + "\n")
+
+            count += 1
+            status_counts[submission.status] += 1
+            if submission.rejection_reason:
+                rejection_reason_counts[submission.rejection_reason] += 1
+            domains.add(submission.name)
+            timestamps.add(submission.submitted_on)
+
+        return {
+            "count": count,
+            "distinct_domains": len(domains),
+            "status_counts": dict(status_counts),
+            "rejection_reason_counts": dict(rejection_reason_counts),
             "timestamp_range": timestamps.range(),
         }
 
