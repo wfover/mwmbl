@@ -22,6 +22,16 @@ Metrics vs the LLM labels:
 
 Scores are cached per judge in devdata/judge_bakeoff/ so reruns are instant.
 
+Fine-tuned judges (see scripts/modal_judge_train.py): pass --model-dir
+devdata/judge_train/models/<run> to register `ft_<run>` (ONNX fp32),
+`ft_<run>_int8` (quantized) and `ft_<run>_torch` (score cache exported by the
+training job). ONNX judges need onnxruntime+tokenizers instead of fastembed.
+
+Held-out mode: --eval-manifest devdata/judge_train/eval_manifest.json scores
+the full dataset (caches stay full-length) but computes metrics only on the
+manifest's held-out rows, writing results_heldout.json — fine-tuned judges must
+only ever be reported in this mode.
+
 Run:  uv run --with fastembed python scripts/judge_bakeoff.py [--judges a,b,...]
 """
 from __future__ import annotations
@@ -118,8 +128,61 @@ def score_jina_turbo_ce(rows: list[dict]) -> np.ndarray:
     return _cross_encoder(rows, "jinaai/jina-reranker-v1-turbo-en", "jina_turbo_ce")
 
 
+def onnx_cross_encoder(rows: list[dict], onnx_dir: Path, model_file: str,
+                       label: str, max_length: int = 256,
+                       batch_size: int = 64) -> np.ndarray:
+    """Score (query, doc_text) rows with a local exported cross-encoder."""
+    import onnxruntime
+    from tokenizers import Tokenizer
+
+    tokenizer = Tokenizer.from_file(str(onnx_dir / "tokenizer.json"))
+    tokenizer.enable_truncation(max_length=max_length)
+    tokenizer.enable_padding()
+    session = onnxruntime.InferenceSession(str(onnx_dir / model_file))
+    input_names = {i.name for i in session.get_inputs()}
+
+    scores = np.zeros(len(rows))
+    for start in range(0, len(rows), batch_size):
+        batch = rows[start:start + batch_size]
+        encodings = tokenizer.encode_batch(
+            [(row["query"], row["doc_text"]) for row in batch])
+        feed = {"input_ids": np.array([e.ids for e in encodings], dtype=np.int64),
+                "attention_mask": np.array([e.attention_mask for e in encodings],
+                                           dtype=np.int64)}
+        if "token_type_ids" in input_names:
+            feed["token_type_ids"] = np.array([e.type_ids for e in encodings],
+                                              dtype=np.int64)
+        logits = session.run(None, feed)[0][:, 0]
+        scores[start:start + len(batch)] = 1 / (1 + np.exp(-logits.astype(np.float64)))
+        if (start + batch_size) % 4992 < batch_size:
+            print(f"  {label}: {start + len(batch)}/{len(rows)}", flush=True)
+    return scores
+
+
 SCORERS = {"term_overlap": score_term_overlap, "nomic_cosine": score_nomic_cosine,
            "minilm_ce": score_minilm_ce, "jina_turbo_ce": score_jina_turbo_ce}
+
+
+def register_finetuned(model_dir: Path) -> list[str]:
+    """Register `ft_<run>` judges for a modal_judge_train.py artifact dir."""
+    run = model_dir.name
+    names = []
+    onnx_dir = model_dir / "onnx"
+    for suffix, model_file in (("", "model.onnx"), ("_int8", "model.int8.onnx")):
+        if (onnx_dir / model_file).exists():
+            name = f"ft_{run}{suffix}"
+            SCORERS[name] = lambda rows, f=model_file, n=f"ft_{run}{suffix}": \
+                onnx_cross_encoder(rows, onnx_dir, f, n)
+            names.append(name)
+    torch_scores = model_dir / "llm_scores.npy"
+    if torch_scores.exists():
+        name = f"ft_{run}_torch"
+        cache = CACHE_DIR / f"scores_{name}.npy"
+        if not cache.exists():
+            CACHE_DIR.mkdir(parents=True, exist_ok=True)
+            cache.write_bytes(torch_scores.read_bytes())
+        names.append(name)
+    return names
 
 
 def judge_scores(name: str, rows: list[dict]) -> np.ndarray:
@@ -234,21 +297,47 @@ def evaluate(name: str, rows: list[dict], scores: np.ndarray) -> dict:
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("--judges", default=",".join(ALL_JUDGES),
-                        help=f"comma-separated subset of {ALL_JUDGES}")
+    parser.add_argument("--judges", default=None,
+                        help=f"comma-separated subset of {ALL_JUDGES} and any "
+                             "registered ft_* judges (default: all)")
+    parser.add_argument("--model-dir", type=Path, action="append", default=[],
+                        help="fine-tuned model artifact dir (repeatable); "
+                             "registers ft_<run>[,_int8,_torch] judges")
+    parser.add_argument("--eval-manifest", type=Path, default=None,
+                        help="eval_manifest.json: compute metrics on its "
+                             "held-out rows only (results_heldout.json)")
     args = parser.parse_args()
+
+    finetuned = [name for model_dir in args.model_dir
+                 for name in register_finetuned(model_dir)]
+    judges = (args.judges.split(",") if args.judges
+              else list(ALL_JUDGES) + finetuned)
 
     rows = load_dataset()
     print(f"dataset: {len(rows)} rows, {len({r['query'] for r in rows})} queries")
 
+    eval_rows, eval_slice = rows, slice(None)
+    results_file = "results.json"
+    if args.eval_manifest:
+        manifest = json.loads(args.eval_manifest.read_text())
+        eval_slice = np.array(manifest["llm_eval_row_indexes"])
+        eval_rows = [rows[i] for i in eval_slice]
+        results_file = "results_heldout.json"
+        print(f"held-out eval: {len(eval_rows)} rows, "
+              f"{len({r['query'] for r in eval_rows})} queries "
+              f"({manifest['source_eligible_eval_queries']} source-eligible)")
+    elif finetuned:
+        parser.error("fine-tuned judges must be evaluated with --eval-manifest "
+                     "(their training saw the non-held-out queries)")
+
     results = []
-    for name in args.judges.split(","):
+    for name in judges:
         scores = judge_scores(name.strip(), rows)
-        results.append(evaluate(name.strip(), rows, scores))
+        results.append(evaluate(name.strip(), eval_rows, scores[eval_slice]))
         print(json.dumps(results[-1]))
 
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
-    (CACHE_DIR / "results.json").write_text(json.dumps(results, indent=2))
+    (CACHE_DIR / results_file).write_text(json.dumps(results, indent=2))
     print("\n=== bake-off results ===")
     keys = list(results[0].keys())
     print(" | ".join(f"{k:>28s}" if i == 0 else k for i, k in enumerate(keys)))
