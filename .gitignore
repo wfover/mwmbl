@@ -197,6 +197,7 @@ prescreen.json
 devdata/ss_eval_matrix*
 devdata/ss_gold_matrix*
 devdata/ss_judge_matrix*
+devdata/ss_judge_queries.txt
 devdata/super_search_xgb/
 
 # AI planning documents

@@ -264,3 +264,64 @@ def test_policy_unknown_mode_raises(monkeypatch):
     names = ["mwmbl", "hn"] + [f"site{i}" for i in range(20)]
     with pytest.raises(ValueError, match="SUPER_SEARCH_SELECTION_MODE"):
         policy.select_sources("some query", names, k=5)
+
+
+# ---------------------------------------------------------------------------
+# Online retrain from the impression log
+# ---------------------------------------------------------------------------
+
+@pytest.mark.django_db
+def test_retrain_from_impressions_writes_artifact(tmp_path, monkeypatch):
+    from mwmbl.models import SuperSearchImpression
+
+    monkeypatch.setattr(xgb_model, "XGB_PARAMS", FAST_PARAMS)
+    for features, rewards in _interaction_rows(30):
+        SuperSearchImpression.objects.create(
+            candidates=list(features), selected=list(features),
+            features={k: list(v) for k, v in features.items()}, rewards=rewards)
+    # A pre-intent row with a short (10-dim) vector must zero-pad, not break.
+    SuperSearchImpression.objects.create(
+        candidates=["old"], selected=["old"],
+        features={"old": [1.0] * 10}, rewards={"old": 0.5})
+
+    metrics = xgb_model.train_and_save_from_impressions(
+        window_days=7, min_rows=10, out_dir=tmp_path)
+    assert metrics is not None and "train_rmse" in metrics
+    loaded = xgb_model.load_artifact(tmp_path)
+    assert {"github", "recipes", "old"} <= set(loaded.vocab)
+    assert loaded.meta["reward_kind"] == "judge"
+    assert loaded.meta["n_rows"] == 61
+
+
+@pytest.mark.django_db
+def test_retrain_skips_below_min_rows(tmp_path):
+    from mwmbl.models import SuperSearchImpression
+
+    SuperSearchImpression.objects.create(
+        candidates=["a"], selected=["a"],
+        features={"a": [0.0] * NUM_FEATURES}, rewards={"a": 1.0})
+    assert xgb_model.train_and_save_from_impressions(
+        window_days=7, min_rows=100, out_dir=tmp_path) is None
+    assert not (tmp_path / xgb_model.META_FILE).exists()
+
+
+# ---------------------------------------------------------------------------
+# Privacy tripwire: nothing vector-valued may enter the persisted features
+# ---------------------------------------------------------------------------
+
+def test_persisted_features_are_scalar_and_reconstruction_safe():
+    """Impressions persist the feature vector per source; every entry must be a
+    named scalar that cannot reconstruct the query. A name matching the pattern
+    below suggests someone is about to log a raw projection/embedding — that
+    needs conscious review, hence this tripwire."""
+    import re
+
+    from mwmbl.tinysearchengine.super_search_select.features import (
+        QueryContext, feature_vector,
+    )
+    from mwmbl.tinysearchengine.super_search_select.registry import get_meta
+
+    assert not any(re.search(r"proj|embed|vec|hash", name) for name in FEATURE_NAMES)
+    qctx = QueryContext.build("some test query", np.zeros(64), np.zeros(64))
+    x = feature_vector(qctx, get_meta("github"), (None, None))
+    assert x.shape == (len(FEATURE_NAMES),)

@@ -6,6 +6,14 @@
 query-vs-site-profile cosines (``cos_bow`` / ``cos_cng``); the rest are site
 priors, online per-site stats, and cheap query-shape signals. Which features
 actually earn their keep is decided by the offline evaluation (Phase 5).
+
+PRIVACY INVARIANT: these vectors are persisted per impression
+(``SuperSearchImpression.features``) while the query text never is. Every
+feature must therefore be a scalar that does not permit reconstructing the
+query — coarse counts, bits from public lexicons, cosines against known site
+profiles are fine; raw query projections/embeddings are not and must never be
+added here. ``test_persisted_features_are_scalar_and_reconstruction_safe``
+trips if a feature name suggests otherwise.
 """
 from __future__ import annotations
 

@@ -125,6 +125,31 @@ def sync_super_search_bandit():
 
 
 @background(schedule=0)
+def retrain_super_search_xgb():
+    """Daily batch retrain of the Super Search xgb source model.
+
+    The impression log is the contextual bandit's memory: this folds the last
+    training window of logged (features, judge-reward) pairs into a fresh
+    XGBoost artifact, which serving processes hot-reload via its mtime. Skips
+    (with a log line) when the mode isn't xgb or too few pairs have
+    accumulated; training/IO errors propagate so failures are visible.
+    """
+    from mwmbl.tinysearchengine.super_search_select import xgb_model
+
+    if settings.SUPER_SEARCH_SELECTION_MODE != "xgb":
+        logger.info("super-search xgb retrain skipped: selection mode is %s",
+                    settings.SUPER_SEARCH_SELECTION_MODE)
+        return
+    metrics = xgb_model.train_and_save_from_impressions(
+        window_days=settings.SUPER_SEARCH_XGB_TRAIN_WINDOW_DAYS,
+        min_rows=settings.SUPER_SEARCH_XGB_MIN_TRAIN_ROWS,
+        out_dir=settings.SUPER_SEARCH_XGB_MODEL_DIR,
+    )
+    if metrics is not None:
+        logger.info("super-search xgb retrained: %s", metrics)
+
+
+@background(schedule=0)
 def sync_search_counts():
     """
     Bidirectional sync between Redis and UsageBucket, run once per hour.

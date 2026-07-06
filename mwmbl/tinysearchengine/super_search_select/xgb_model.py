@@ -150,6 +150,41 @@ def train(X: np.ndarray, y: np.ndarray, params: dict | None = None):
     return model
 
 
+def train_and_save_from_impressions(
+    window_days: int, min_rows: int, out_dir: str | Path,
+) -> dict | None:
+    """Batch retrain from logged ``SuperSearchImpression`` rows.
+
+    The impression log stores per-source shared feature vectors (keyed by
+    source name — that key is the identity feature) and judge rewards, never
+    the query text, so this is the privacy-safe online learning path. Returns
+    the saved metrics, or None when fewer than ``min_rows`` (source, reward)
+    pairs exist in the window (the designed not-enough-data-yet case; anything
+    else that goes wrong raises).
+    """
+    from datetime import timedelta
+
+    from mwmbl.models import SuperSearchImpression
+    from mwmbl.tinysearchengine.super_search_sources import SOURCES
+
+    cutoff = datetime.now(timezone.utc) - timedelta(days=window_days)
+    rows = list(SuperSearchImpression.objects.filter(timestamp__gte=cutoff)
+                .values_list("features", "rewards"))
+    n_pairs = sum(len(set(f) & set(r)) for f, r in rows)
+    if n_pairs < min_rows:
+        logger.info("super-search xgb retrain skipped: %d pairs in %d days "
+                    "(need %d)", n_pairs, window_days, min_rows)
+        return None
+    names = {name for f, _ in rows for name in f} | set(SOURCES)
+    vocab = build_vocab(names)
+    X, y = build_training_data(rows, vocab)
+    model = train(X, y)
+    metrics = {"train_rmse": float(np.sqrt(np.mean((model.predict(X) - y) ** 2)))}
+    save_artifact(model, vocab, out_dir, reward_kind="judge",
+                  n_rows=len(y), metrics=metrics)
+    return metrics
+
+
 # ---------------------------------------------------------------------------
 # Artifact save / load
 # ---------------------------------------------------------------------------
