@@ -171,7 +171,7 @@ def _propagate_source_provenance(crawled_page_links: dict[str, list[str]]):
             for link_url in link_urls:
                 rows.append(SourceProvenance(
                     url=link_url, source=source, parent_url=page_url[:500],
-                    depth=depth + 1, query=None,
+                    depth=depth + 1,
                 ))
         if rows:
             SourceProvenance.objects.bulk_create(rows, ignore_conflicts=True)

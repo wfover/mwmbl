@@ -233,9 +233,9 @@ class SuperSearchImpression(models.Model):
     the features they were selected on, and the implicit reward each earned.
 
     Feeds the offline feature-selection / policy-tuning harness and provides
-    durable training data for the contextual bandit.
+    durable training data for the contextual bandit. Deliberately does not
+    store the query text, to avoid persisting user search history.
     """
-    query = models.CharField(max_length=512)
     candidates = models.JSONField(default=list)   # all selectable source names (action space)
     selected = models.JSONField(default=list)     # sources actually queried
     features = models.JSONField(default=dict)     # {source: [feature vector]} for selected sources
@@ -267,11 +267,11 @@ class SourceProvenance(models.Model):
 
     Written for each URL a source returns, and propagated onto links found on
     pages later crawled from those URLs, so source usefulness can be judged
-    offline including for descendant pages.
+    offline including for descendant pages. Deliberately does not store the
+    query text, to avoid persisting user search history.
     """
     url = models.URLField(max_length=500, unique=True)   # first source wins, matches source_by_url semantics
     source = models.CharField(max_length=128)            # super-search source name (e.g. "gov.uk")
-    query = models.CharField(max_length=512, null=True, blank=True)  # query for direct results; null when propagated
     parent_url = models.URLField(max_length=500, null=True, blank=True)  # page this URL was found on (null = direct result)
     depth = models.IntegerField(default=0)               # 0 = direct super-search result; +1 per crawl hop
     timestamp = models.DateTimeField(auto_now_add=True)

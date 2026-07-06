@@ -77,7 +77,7 @@ def test_propagate_source_provenance_noop_without_database(monkeypatch):
 @pytest.mark.django_db
 def test_propagate_source_provenance_carries_source_to_links(monkeypatch):
     monkeypatch.setattr("django.conf.settings.HAS_DATABASE", True)
-    SourceProvenance.objects.create(url=PAGE, source="gov.uk", query="benefits", depth=0)
+    SourceProvenance.objects.create(url=PAGE, source="gov.uk", depth=0)
 
     _propagate_source_provenance({PAGE: [CHILD_1, CHILD_2]})
 
@@ -86,7 +86,6 @@ def test_propagate_source_provenance_carries_source_to_links(monkeypatch):
         assert row.source == "gov.uk"
         assert row.parent_url == PAGE
         assert row.depth == 1
-        assert row.query is None
 
 
 @pytest.mark.django_db

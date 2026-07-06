@@ -75,7 +75,7 @@ def compute_judge_rewards(ctx: SelectionContext) -> dict[str, float] | None:
             for name, (total, count) in totals.items()}
 
 
-def log_impression(query: str, ctx: SelectionContext, rewards: dict[str, float]) -> None:
+def log_impression(ctx: SelectionContext, rewards: dict[str, float]) -> None:
     """Persist a SuperSearchImpression row (no-op without a database)."""
     if not getattr(settings, "HAS_DATABASE", False):
         return
@@ -83,7 +83,6 @@ def log_impression(query: str, ctx: SelectionContext, rewards: dict[str, float])
         from mwmbl.models import SuperSearchImpression
 
         SuperSearchImpression.objects.create(
-            query=query[:512],
             candidates=ctx.candidates,
             selected=ctx.selected,
             features=ctx.features,
@@ -93,7 +92,7 @@ def log_impression(query: str, ctx: SelectionContext, rewards: dict[str, float])
         logger.exception("failed to log super-search impression")
 
 
-def record_source_provenance(query: str, ctx: SelectionContext) -> None:
+def record_source_provenance(ctx: SelectionContext) -> None:
     """Persist a SourceProvenance row per (url, source) Super Search returned.
 
     Records the durable url -> source mapping (depth 0) so source usefulness can
@@ -109,7 +108,7 @@ def record_source_provenance(query: str, ctx: SelectionContext) -> None:
         from mwmbl.models import SourceProvenance
 
         rows = [
-            SourceProvenance(url=url, source=source, query=query[:512], depth=0)
+            SourceProvenance(url=url, source=source, depth=0)
             for url, source in ctx.source_by_url.items()
         ]
         SourceProvenance.objects.bulk_create(rows, ignore_conflicts=True)

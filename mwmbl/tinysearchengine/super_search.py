@@ -534,7 +534,7 @@ def _enqueue_discovered_urls(ctx: SelectionContext) -> None:
         _add_found_urls_to_db_and_queue(found_urls, queued_batches)
 
 
-async def _record_rewards(query: str, ctx: SelectionContext, last_results_key: list) -> None:
+async def _record_rewards(ctx: SelectionContext, last_results_key: list) -> None:
     """Compute per-source rewards and log the impression.
 
     Preferred reward: mean relevance-judge score of each source's final-pool
@@ -549,11 +549,11 @@ async def _record_rewards(query: str, ctx: SelectionContext, last_results_key: l
         top_k = getattr(settings, "SUPER_SEARCH_TOP_K", 10)
         rewards = compute_rewards(ctx, final_urls[:top_k])
     try:
-        await asyncio.to_thread(log_impression, query, ctx, rewards)
+        await asyncio.to_thread(log_impression, ctx, rewards)
     except Exception:
         logger.exception("super-search failed to record rewards")
     try:
-        await asyncio.to_thread(record_source_provenance, query, ctx)
+        await asyncio.to_thread(record_source_provenance, ctx)
     except Exception:
         logger.exception("super-search failed to record source provenance")
     try:
@@ -697,7 +697,7 @@ async def _sse_stream(query: str, monthly_usage: int, monthly_limit: int):
                 except Exception:
                     logger.exception("super-search failed to emit final results")
                 pages_indexed = await _index_results(query, all_docs)
-                await _record_rewards(query, selection_ctx, last_results_key)
+                await _record_rewards(selection_ctx, last_results_key)
             await queue.put(_SENTINEL)
 
     task = asyncio.create_task(producer())
