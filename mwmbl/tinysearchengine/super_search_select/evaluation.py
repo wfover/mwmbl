@@ -8,9 +8,20 @@ top-K), and a ``mask`` of which sources actually returned anything.
 With every cell filled we can, without any online traffic:
   * select features  — fit an XGBoost reward model (grouped CV by query) and
     rank/ablate features by held-out recall@k;
-  * simulate the policy — replay linear-Gaussian Thompson sampling over the
-    matrix, sweep the exploration scale ``nu``, and compare against baselines
-    (random / popularity / cosine / oracle).
+  * simulate the policy — replay linear-Gaussian Thompson sampling
+    (``simulate_ts``) or the epsilon-greedy XGBoost contextual bandit
+    (``simulate_xgb``) over the matrix and compare against baselines
+    (random / popularity / cosine / oracle);
+  * holdout-evaluate the xgb source model (``evaluate_holdout``): split
+    queries into train/test (stratified by each query's home source), fit on
+    train, and report test coverage@k / home-source recall@k against the same
+    baselines plus a train-then-greedy LinTS comparator.
+
+Off-policy note: replay over a *dense* matrix is unbiased (every arm's
+counterfactual reward is known). The online impression log, by contrast, is
+conditioned on whatever policy was live; the mitigations are warm-starting
+from a dense offline matrix and the epsilon slots continuously injecting
+randomized pairs.
 
 This module is pure (numpy/sklearn/xgboost only); building the matrix from live
 sources lives in ``scripts/super_search_eval.py``.
@@ -212,3 +223,208 @@ def sweep_explore_scale(matrix: RewardMatrix, k: int, nus: list[float],
                         sigma2: float = 0.25, lam: float = 1.0, seed: int = 0) -> dict[float, float]:
     """Mean captured reward for each candidate exploration scale ``nu``."""
     return {nu: simulate_ts(matrix, k, nu, sigma2, lam, seed) for nu in nus}
+
+
+def simulate_xgb(matrix: RewardMatrix, k: int, epsilon: float,
+                 refit_every: int = 200, min_rows: int = 300, seed: int = 0,
+                 params: dict | None = None) -> float:
+    """Replay the epsilon-greedy XGBoost contextual bandit over the matrix.
+
+    Mirrors ``simulate_ts``'s contract (mean per-query captured reward).
+    Queries are visited in a seeded shuffled order; until ``min_rows`` chosen
+    (source, reward) pairs have accumulated, selection uses the cosine
+    baseline (matching how real impression logs bootstrap), after which the
+    model is fit and refit every ``refit_every`` queries.
+    """
+    from mwmbl.tinysearchengine.super_search_select import xgb_model
+
+    rng = np.random.default_rng(seed)
+    Q = matrix.X.shape[0]
+    vocab = xgb_model.build_vocab(matrix.sources)
+    vocab_index = {name: i for i, name in enumerate(vocab)}
+    cos_i = matrix.feature_names.index("cos_bow")
+
+    model = None
+    xs: list[np.ndarray] = []
+    ys: list[float] = []
+    captured = 0.0
+    since_fit = 0
+    for q in rng.permutation(Q):
+        avail = np.where(matrix.mask[q])[0]
+        if avail.size == 0:
+            continue
+        k_q = min(k, avail.size)
+        if model is None:
+            chosen = avail[np.argsort(matrix.X[q, avail, cos_i])[::-1][:k_q]]
+        else:
+            enc = np.stack([xgb_model.encode(matrix.X[q, s], matrix.sources[s], vocab_index)
+                            for s in avail])
+            ranked = avail[np.argsort(model.predict(enc))[::-1]]
+            n_explore = int(rng.binomial(k_q, epsilon))
+            chosen = list(ranked[:k_q - n_explore])
+            rest = ranked[k_q - n_explore:]
+            if n_explore and rest.size:
+                chosen += list(rng.choice(rest, size=min(n_explore, rest.size), replace=False))
+            chosen = np.asarray(chosen)
+        for s in chosen:
+            xs.append(xgb_model.encode(matrix.X[q, s], matrix.sources[s], vocab_index))
+            ys.append(float(matrix.R[q, s]))
+            captured += matrix.R[q, s]
+        since_fit += 1
+        if len(ys) >= min_rows and (model is None or since_fit >= refit_every):
+            model = xgb_model.train(np.stack(xs), np.asarray(ys), params=params)
+            since_fit = 0
+    return captured / Q
+
+
+def sweep_epsilon(matrix: RewardMatrix, k: int, epsilons: list[float],
+                  refit_every: int = 200, min_rows: int = 300,
+                  seed: int = 0) -> dict[float, float]:
+    """Mean captured reward for each candidate exploration rate ``epsilon``."""
+    return {eps: simulate_xgb(matrix, k, eps, refit_every, min_rows, seed)
+            for eps in epsilons}
+
+
+# ---------------------------------------------------------------------------
+# Holdout evaluation of the xgb source model
+# ---------------------------------------------------------------------------
+
+def _holdout_split(matrix: RewardMatrix, home: list[str | None], test_frac: float,
+                   seed: int) -> tuple[np.ndarray, np.ndarray]:
+    """Split query indices into (train, test), stratified by home source so
+    every source's home queries appear in both splits where possible."""
+    rng = np.random.default_rng(seed)
+    by_home: dict[str | None, list[int]] = {}
+    for q, h in enumerate(home):
+        by_home.setdefault(h, []).append(q)
+    test: list[int] = []
+    for qs in by_home.values():
+        qs = list(rng.permutation(qs))
+        n_test = round(len(qs) * test_frac)
+        if len(qs) >= 2:
+            n_test = max(n_test, 1)
+        test.extend(qs[:n_test])
+    test_idx = np.array(sorted(test), dtype=int)
+    train_idx = np.array(sorted(set(range(len(home))) - set(test)), dtype=int)
+    return train_idx, test_idx
+
+
+def _home_recall_at_k(scores: np.ndarray, matrix: RewardMatrix,
+                      home: list[str | None], rows: np.ndarray, k: int) -> float:
+    """Fraction of queries whose home source lands in the top-k scored sources."""
+    s_index = {name: i for i, name in enumerate(matrix.sources)}
+    hits, n = 0, 0
+    for q in rows:
+        h = home[q]
+        if h is None or h not in s_index:
+            continue
+        avail = np.where(matrix.mask[q])[0]
+        if avail.size == 0 or s_index[h] not in avail:
+            continue
+        top = avail[np.argsort(scores[q, avail])[::-1][:k]]
+        hits += int(s_index[h] in top)
+        n += 1
+    return hits / n if n else 0.0
+
+
+def _lints_posterior_means(matrix: RewardMatrix, train_idx: np.ndarray, k: int,
+                           nu: float = 0.05, sigma2: float = 0.25,
+                           lam: float = 1.0, seed: int = 0) -> np.ndarray:
+    """Replay LinTS over the train queries; return per-arm posterior means for
+    greedy scoring of held-out queries."""
+    rng = np.random.default_rng(seed)
+    S, F = matrix.X.shape[1], matrix.X.shape[2]
+    A = np.stack([lam * np.eye(F) for _ in range(S)])
+    b = np.zeros((S, F))
+    for q in train_idx:
+        avail = np.where(matrix.mask[q])[0]
+        if avail.size == 0:
+            continue
+        scores = np.full(S, -np.inf)
+        for s in avail:
+            A_inv = np.linalg.inv(A[s])
+            mean = A_inv @ b[s]
+            cov = (nu * nu * sigma2) * A_inv
+            theta = rng.multivariate_normal(mean, 0.5 * (cov + cov.T))
+            scores[s] = theta @ matrix.X[q, s]
+        for s in avail[np.argsort(scores[avail])[::-1][:k]]:
+            x = matrix.X[q, s]
+            A[s] += np.outer(x, x)
+            b[s] += matrix.R[q, s] * x
+    return np.stack([np.linalg.inv(A[s]) @ b[s] for s in range(S)])
+
+
+def evaluate_holdout(matrix: RewardMatrix, k: int = 10, test_frac: float = 0.2,
+                     seed: int = 0, home_by_query: dict[str, str] | None = None,
+                     params: dict | None = None) -> dict:
+    """Train the xgb source model on a query split, evaluate on the rest.
+
+    ``home_by_query`` maps a query to the source it was written for (the
+    synthetic per-source query set); if omitted, each query's oracle-best
+    source stands in. Returns test coverage@k, RMSE, home-source recall@k,
+    and the same metrics for random/popularity/cosine baselines plus a
+    train-then-greedy LinTS comparator.
+    """
+    from mwmbl.tinysearchengine.super_search_select import xgb_model
+
+    if home_by_query is not None:
+        home = [home_by_query.get(q) for q in matrix.queries]
+    else:
+        home = [matrix.sources[int(np.argmax(np.where(matrix.mask[q], matrix.R[q], -np.inf)))]
+                if matrix.mask[q].any() else None
+                for q in range(len(matrix.queries))]
+    train_idx, test_idx = _holdout_split(matrix, home, test_frac, seed)
+
+    vocab = xgb_model.build_vocab(matrix.sources)
+    vocab_index = {name: i for i, name in enumerate(vocab)}
+
+    def rows_for(idx: np.ndarray):
+        xs, ys, cells = [], [], []
+        for q in idx:
+            for s in np.where(matrix.mask[q])[0]:
+                xs.append(xgb_model.encode(matrix.X[q, s], matrix.sources[s], vocab_index))
+                ys.append(float(matrix.R[q, s]))
+                cells.append((q, s))
+        return np.stack(xs), np.asarray(ys), cells
+
+    X_train, y_train, _ = rows_for(train_idx)
+    X_test, y_test, test_cells = rows_for(test_idx)
+    model = xgb_model.train(X_train, y_train, params=params)
+    preds = model.predict(X_test)
+
+    scores = np.full(matrix.R.shape, -np.inf)
+    for (q, s), p in zip(test_cells, preds):
+        scores[q, s] = p
+
+    R_t, m_t = matrix.R[test_idx], matrix.mask[test_idx]
+
+    def coverage(score_grid: np.ndarray) -> float:
+        return coverage_at_k(score_grid[test_idx], R_t, m_t, k)
+
+    rng = np.random.default_rng(seed)
+    rand_scores = rng.random(matrix.R.shape)
+    pop_i = matrix.feature_names.index("popularity")
+    cos_i = matrix.feature_names.index("cos_bow")
+    theta = _lints_posterior_means(matrix, train_idx, k, seed=seed)
+    lints_scores = np.einsum("qsf,sf->qs", matrix.X, theta)
+
+    out = {
+        "n_train_queries": int(train_idx.size),
+        "n_test_queries": int(test_idx.size),
+        "rmse": float(np.sqrt(np.mean((preds - y_test) ** 2))),
+        "coverage_at_k": {
+            "xgb": coverage(scores),
+            "lints_greedy": coverage(lints_scores),
+            "cosine": coverage(matrix.X[:, :, cos_i]),
+            "popularity": coverage(matrix.X[:, :, pop_i]),
+            "random": coverage(rand_scores),
+        },
+        "home_recall_at_k": {
+            "xgb": _home_recall_at_k(scores, matrix, home, test_idx, k),
+            "lints_greedy": _home_recall_at_k(lints_scores, matrix, home, test_idx, k),
+            "cosine": _home_recall_at_k(matrix.X[:, :, cos_i], matrix, home, test_idx, k),
+            "popularity": _home_recall_at_k(matrix.X[:, :, pop_i], matrix, home, test_idx, k),
+            "random": _home_recall_at_k(rand_scores, matrix, home, test_idx, k),
+        },
+    }
+    return out

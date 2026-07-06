@@ -100,6 +100,77 @@ def test_feature_selection_flags_cos_bow(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# XGB contextual bandit: replay + holdout evaluation
+# ---------------------------------------------------------------------------
+
+FAST_XGB = {"n_estimators": 50, "max_depth": 6, "learning_rate": 0.1,
+            "subsample": 0.8, "random_state": 0}
+
+
+def _routing_matrix(Q=160, S=16, seed=0):
+    """Planted intent -> source routing that only identity x intent explains:
+    each source is affine to one intent, each query carries one intent, and the
+    reward is high iff they match. Shared features alone can't predict it.
+    Returns (matrix, home_by_query) where home is the designated matched source.
+    """
+    rng = np.random.default_rng(seed)
+    F = len(FEATURE_NAMES)
+    n_intents = 8
+    first_intent = FEATURE_NAMES.index("intent_code")
+    X = np.zeros((Q, S, F))
+    X[:, :, 0] = 1.0  # bias
+    R = np.zeros((Q, S))
+    home = {}
+    for q in range(Q):
+        intent = q % n_intents
+        X[q, :, first_intent + intent] = 1.0
+        matched = [s for s in range(S) if s % n_intents == intent]
+        for s in range(S):
+            base = 0.9 if s % n_intents == intent else 0.1
+            R[q, s] = np.clip(base + 0.02 * rng.standard_normal(), 0.0, 1.0)
+        home[f"q{q}"] = f"s{matched[q % len(matched)]}"
+    mask = np.ones((Q, S), dtype=bool)
+    matrix = RewardMatrix(
+        queries=[f"q{i}" for i in range(Q)],
+        sources=[f"s{i}" for i in range(S)],
+        feature_names=list(FEATURE_NAMES), X=X, R=R, mask=mask,
+    )
+    return matrix, home
+
+
+def test_simulate_xgb_beats_random():
+    pytest.importorskip("xgboost")
+    m = _synthetic_matrix()
+    base = evaluation.simulate_baselines(m, k=10)
+    captured = evaluation.simulate_xgb(m, k=10, epsilon=0.1, refit_every=30,
+                                       min_rows=100, params=FAST_XGB)
+    assert captured > base["random"]
+    assert captured <= base["oracle"] + 1e-9
+
+
+def test_evaluate_holdout_learns_identity_intent_routing():
+    pytest.importorskip("xgboost")
+    m, home = _routing_matrix()
+    result = evaluation.evaluate_holdout(m, k=3, test_frac=0.25,
+                                         home_by_query=home, params=FAST_XGB)
+    cov, recall = result["coverage_at_k"], result["home_recall_at_k"]
+    # Only identity x intent explains the reward: xgb should crush the
+    # identity-blind baselines on both metrics.
+    assert cov["xgb"] > cov["random"] + 0.1
+    assert cov["xgb"] > cov["popularity"]
+    assert recall["xgb"] > recall["random"] + 0.2
+    assert result["rmse"] < 0.2
+
+
+def test_evaluate_holdout_default_home_is_oracle_best():
+    pytest.importorskip("xgboost")
+    m, _ = _routing_matrix(Q=80, S=8)
+    result = evaluation.evaluate_holdout(m, k=3, test_frac=0.25, params=FAST_XGB)
+    assert result["n_train_queries"] + result["n_test_queries"] == 80
+    assert 0.0 <= result["home_recall_at_k"]["xgb"] <= 1.0
+
+
+# ---------------------------------------------------------------------------
 # Domain matching (shared helpers behind the gold-grounded matrix)
 # ---------------------------------------------------------------------------
 
