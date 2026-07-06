@@ -560,7 +560,9 @@ async def _record_rewards(ctx: SelectionContext, last_results_key: list) -> None
         await asyncio.to_thread(_enqueue_discovered_urls, ctx)
     except Exception:
         logger.exception("super-search failed to enqueue discovered urls")
-    if getattr(settings, "SUPER_SEARCH_USE_BANDIT", False):
+    # Only the per-arm LinTS bandit needs a per-request update; the xgb policy
+    # learns from the impression log in batch.
+    if getattr(settings, "SUPER_SEARCH_SELECTION_MODE", "cosine") == "lints":
         try:
             await asyncio.to_thread(ss_bandit.update, ctx.features, rewards)
         except Exception:

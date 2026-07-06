@@ -1,17 +1,20 @@
 """Source-selection policy: pick which ~10 of ~100 sources to query.
 
-Two interchangeable scorings over the same context features:
+Three interchangeable scorings over the same context features, chosen by
+``SUPER_SEARCH_SELECTION_MODE``:
 
-- **cosine baseline** (default): greedy query-vs-profile cosine, with a few
-  reserved slots for cold sites so new sources are discovered.
-- **Thompson sampling** (``SUPER_SEARCH_USE_BANDIT``): per-arm linear-Gaussian
-  posterior sampling, which explores cold arms automatically via their wide
-  posterior.
+- **cosine** (default): greedy query-vs-profile cosine, with a few reserved
+  slots for cold sites so new sources are discovered.
+- **lints**: per-arm linear-Gaussian Thompson sampling, which explores cold
+  arms automatically via their wide posterior.
+- **xgb**: contextual bandit — an XGBoost model predicts each source's judge
+  reward from the context features plus a source-identity one-hot, with
+  epsilon-greedy exploration. Learns in batch from the impression log.
 
-Either way the always-on global sources (own index, HN) are included for free,
-and the feature vectors used for the decision are stashed on the
-``SelectionContext`` so the bandit update at request completion is consistent
-with the action taken.
+Whichever runs, the always-on global sources (own index, HN) are included for
+free, and the feature vectors used for the decision are stashed on the
+``SelectionContext`` so the reward attribution at request completion is
+consistent with the action taken.
 """
 from __future__ import annotations
 
@@ -20,7 +23,7 @@ import random
 import numpy as np
 from django.conf import settings
 
-from mwmbl.tinysearchengine.super_search_select import bandit, profiles
+from mwmbl.tinysearchengine.super_search_select import bandit, profiles, xgb_model
 from mwmbl.tinysearchengine.super_search_select.features import (
     QueryContext,
     SiteStats,
@@ -68,10 +71,15 @@ def select_sources(
     profs = profiles.get_profiles(selectable)
     feats = {n: feature_vector(qctx, get_meta(n), profs[n]) for n in selectable}
 
-    if settings.SUPER_SEARCH_USE_BANDIT:
+    mode = settings.SUPER_SEARCH_SELECTION_MODE
+    if mode == "xgb":
+        chosen = _select_xgb(selectable, feats, budget)
+    elif mode == "lints":
         chosen = _select_bandit(selectable, feats, budget)
-    else:
+    elif mode == "cosine":
         chosen = _select_cosine(qctx, selectable, profs, budget)
+    else:
+        raise ValueError(f"unknown SUPER_SEARCH_SELECTION_MODE {mode!r}")
 
     if ctx is not None:
         for name in pinned + chosen:
@@ -97,6 +105,25 @@ def _select_cosine(qctx, selectable, profs, budget) -> list[str]:
     if len(chosen) < budget:
         remaining = [n for n in warm[exploit_n:] + cold if n not in set(chosen)]
         chosen += remaining[: budget - len(chosen)]
+    return chosen
+
+
+def _select_xgb(selectable, feats, budget) -> list[str]:
+    """Epsilon-greedy over the XGBoost model's predicted rewards.
+
+    Each of the ``budget`` slots independently explores with probability
+    epsilon: the non-explore slots take the top-scored sources, the explore
+    slots are filled uniformly at random from the rest (cold sources included,
+    so this subsumes the cosine path's explore floor and keeps randomized
+    pairs flowing into the training log).
+    """
+    scores = xgb_model.get_model().score(feats)
+    ranked = sorted(selectable, key=lambda n: scores[n], reverse=True)
+    epsilon = settings.SUPER_SEARCH_XGB_EPSILON
+    n_explore = sum(random.random() < epsilon for _ in range(budget))
+    chosen = ranked[:budget - n_explore]
+    rest = ranked[budget - n_explore:]
+    chosen += random.sample(rest, min(n_explore, len(rest)))
     return chosen
 
 

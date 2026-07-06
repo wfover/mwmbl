@@ -196,6 +196,8 @@ super-search-targets.json
 prescreen.json
 devdata/ss_eval_matrix*
 devdata/ss_gold_matrix*
+devdata/ss_judge_matrix*
+devdata/super_search_xgb/
 
 # AI planning documents
 plans/

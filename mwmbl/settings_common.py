@@ -305,6 +305,20 @@ SUPER_SEARCH_TS_EXPLORE_SCALE = 1.0  # Thompson-sampling posterior-covariance mu
 SUPER_SEARCH_TS_PRIOR_PRECISION = 1.0  # ridge prior precision (lambda); A0 = lambda*I
 SUPER_SEARCH_TS_NOISE_VARIANCE = 0.25  # reward noise variance (sigma^2); reward in [0,1]
 SUPER_SEARCH_QVEC_CACHE_TTL = 3600   # seconds to cache a query's projected vectors
-SUPER_SEARCH_USE_BANDIT = False      # False = cosine-top-10 baseline; True = Thompson sampling
+# Selection strategy: "cosine" (greedy top-10 baseline), "lints" (per-arm
+# Thompson sampling), or "xgb" (contextual bandit: XGBoost reward model with
+# epsilon-greedy exploration). Transitional — cosine/lints are removed once the
+# xgb policy passes the offline gate.
+SUPER_SEARCH_SELECTION_MODE = os.environ.get("SUPER_SEARCH_SELECTION_MODE", "cosine")
 SUPER_SEARCH_FORCE_INCLUDE = []      # source names always queried (high-value sources), like always_on
+
+# XGBoost contextual-bandit source model. The runtime dir receives online
+# retrains (background task); before the first retrain, serving uses the
+# repo-bundled warm-start artifact in super_search_select/artifacts/xgb.
+SUPER_SEARCH_XGB_MODEL_DIR = os.environ.get(
+    "SUPER_SEARCH_XGB_MODEL_DIR",
+    str(Path(__file__).parent.parent / "devdata" / "super_search_xgb"))
+SUPER_SEARCH_XGB_EPSILON = 0.1            # epsilon-greedy exploration rate
+SUPER_SEARCH_XGB_MIN_TRAIN_ROWS = 2000    # (source, reward) pairs required before an online retrain
+SUPER_SEARCH_XGB_TRAIN_WINDOW_DAYS = 90   # impression window for online retrains
 SOURCE_PROVENANCE_MAX_DEPTH = 3      # max crawl hops a Super Search source propagates to descendant pages

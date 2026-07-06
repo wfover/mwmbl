@@ -106,11 +106,11 @@ def test_thompson_prefers_learned_good_arm(fake_bandit_redis):
 
 
 def test_policy_bandit_branch_selects_and_records_features(monkeypatch):
-    """End-to-end: USE_BANDIT selection populates ctx.features and respects k."""
+    """End-to-end: lints selection populates ctx.features and respects k."""
     r = fakeredis.FakeRedis()
     monkeypatch.setattr(bandit, "_redis", r)
     monkeypatch.setattr(profiles, "_redis", r)
-    monkeypatch.setattr("django.conf.settings.SUPER_SEARCH_USE_BANDIT", True)
+    monkeypatch.setattr("django.conf.settings.SUPER_SEARCH_SELECTION_MODE", "lints")
 
     names = ["mwmbl", "hn"] + [f"site{i}" for i in range(20)]
     ctx = SelectionContext()
