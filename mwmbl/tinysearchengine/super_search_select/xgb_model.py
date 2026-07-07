@@ -47,6 +47,7 @@ logger = logging.getLogger(__name__)
 FORMAT_VERSION = 1
 MODEL_FILE = "model.json"
 META_FILE = "meta.json"
+PROFILES_FILE = "profiles.npz"
 
 # Repo-bundled warm-start artifact, committed inside the package so it ships
 # with every deployment (unlike devdata, which may not be mounted).
@@ -125,21 +126,38 @@ def build_training_data(
     return np.stack(xs), np.asarray(ys)
 
 
-def build_training_data_from_matrix(matrix) -> tuple[np.ndarray, np.ndarray, list[str]]:
-    """(X, y, vocab) from a dense offline ``evaluation.RewardMatrix`` (masked cells)."""
+def build_training_data_from_matrix(
+    matrix,
+) -> tuple[np.ndarray, np.ndarray, list[str], dict[str, float]]:
+    """(X, y, vocab, source_reward_means) from a dense offline ``RewardMatrix``.
+
+    Offline matrices carry no online stats, so each source's mean reward over
+    its masked cells is injected into the ``contribution_ema`` slot — the
+    serve-time analog of the ``rstats`` reward EMA. Without this the model
+    would train on a constant-zero column and ignore the live EMA entirely.
+    The means are returned so they can ship in the artifact and seed
+    ``rstats`` at startup, keeping training and serving consistent.
+    """
     if list(matrix.feature_names) != list(FEATURE_NAMES):
         raise ValueError(
             f"matrix feature names {matrix.feature_names} do not match the "
             f"running code's FEATURE_NAMES {list(FEATURE_NAMES)}; rebuild the matrix")
     vocab = build_vocab(matrix.sources)
     vocab_index = {name: i for i, name in enumerate(vocab)}
+    ema_i = FEATURE_NAMES.index("contribution_ema")
+    counts = matrix.mask.sum(axis=0)
+    sums = (matrix.R * matrix.mask).sum(axis=0)
+    source_means = {matrix.sources[s]: float(sums[s] / counts[s]) if counts[s] else 0.0
+                    for s in range(len(matrix.sources))}
     xs, ys = [], []
     for q in range(matrix.X.shape[0]):
         for s in range(matrix.X.shape[1]):
             if matrix.mask[q, s]:
-                xs.append(encode(matrix.X[q, s], matrix.sources[s], vocab_index))
+                x = matrix.X[q, s].copy()
+                x[ema_i] = source_means[matrix.sources[s]]
+                xs.append(encode(x, matrix.sources[s], vocab_index))
                 ys.append(float(matrix.R[q, s]))
-    return np.stack(xs), np.asarray(ys), vocab
+    return np.stack(xs), np.asarray(ys), vocab, source_means
 
 
 def train(X: np.ndarray, y: np.ndarray, params: dict | None = None):
@@ -196,6 +214,7 @@ def save_artifact(
     reward_kind: str,
     n_rows: int,
     metrics: dict | None = None,
+    source_reward_means: dict[str, float] | None = None,
 ) -> None:
     """Atomically write ``model.json`` + ``meta.json`` (meta last: its presence
     and mtime are the load/reload signal)."""
@@ -215,6 +234,9 @@ def save_artifact(
         "n_rows": int(n_rows),
         "metrics": metrics or {},
     }
+    if source_reward_means is not None:
+        # Seeds the rstats reward EMAs at startup (see seed_online_state).
+        meta["source_reward_means"] = {k: round(v, 6) for k, v in source_reward_means.items()}
     tmp_meta = model_dir / (META_FILE + ".tmp")
     tmp_meta.write_text(json.dumps(meta, indent=2))
     os.replace(tmp_meta, model_dir / META_FILE)
@@ -264,6 +286,56 @@ def load_artifact(model_dir: str | Path) -> XgbSourceModel:
         vocab_index={name: i for i, name in enumerate(vocab)},
         meta=meta,
     )
+
+
+def save_profiles(
+    profiles: dict[str, tuple[np.ndarray, np.ndarray]], model_dir: str | Path,
+) -> None:
+    """Write the batch content profiles the model was trained against
+    (``profiles.npz``: sources + bow/cng matrices) into the artifact dir."""
+    model_dir = Path(model_dir)
+    model_dir.mkdir(parents=True, exist_ok=True)
+    sources = sorted(profiles)
+    tmp = model_dir / ("tmp." + PROFILES_FILE)
+    np.savez_compressed(
+        tmp,
+        sources=np.array(sources),
+        bow=np.stack([profiles[s][0] for s in sources]).astype(np.float32),
+        cng=np.stack([profiles[s][1] for s in sources]).astype(np.float32),
+    )
+    # np.savez appends .npz to names without the suffix; tmp already has it.
+    os.replace(tmp, model_dir / PROFILES_FILE)
+
+
+def load_profiles(model_dir: str | Path) -> dict[str, tuple[np.ndarray, np.ndarray]]:
+    arrs = np.load(Path(model_dir) / PROFILES_FILE)
+    return {str(site): (arrs["bow"][i], arrs["cng"][i])
+            for i, site in enumerate(arrs["sources"])}
+
+
+def seed_online_state() -> dict[str, int]:
+    """SETNX-seed Redis with the bundled artifact's online state.
+
+    Content profiles (``profiles.npz``) and per-source reward means
+    (``meta.json``) are what the bundled model's ``cos_*`` and
+    ``contribution_ema`` features were computed against; seeding them makes
+    serving consistent with training from the first request and makes a Redis
+    wipe a non-event. Never overwrites live values, so it is safe to run at
+    every startup. Raises if the bundled artifact lacks the seed data — the
+    bundle is committed with it, so absence is a packaging bug.
+    """
+    from mwmbl.tinysearchengine.super_search_select import profiles as ss_profiles
+    from mwmbl.tinysearchengine.super_search_select import rstats
+
+    seeds = load_profiles(BUNDLED_DIR)
+    meta = json.loads((BUNDLED_DIR / META_FILE).read_text())
+    means = meta["source_reward_means"]
+    seeded = {
+        "profiles": ss_profiles.seed_profiles(seeds),
+        "reward_emas": rstats.seed_stats(means),
+    }
+    logger.info("super-search online state seeded: %s", seeded)
+    return seeded
 
 
 # ---------------------------------------------------------------------------

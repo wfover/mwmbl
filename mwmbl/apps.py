@@ -84,3 +84,12 @@ class MwmblConfig(AppConfig):
         except Exception:
             # Don't prevent startup if background task scheduling fails
             log.exception("Failed to schedule background tasks")
+
+        try:
+            # SETNX-seed Redis content profiles + reward EMAs from the bundled
+            # xgb artifact so serving features match training from the first
+            # request (and a Redis wipe self-heals on next startup).
+            from mwmbl.tinysearchengine.super_search_select import xgb_model
+            xgb_model.seed_online_state()
+        except Exception:
+            log.exception("Failed to seed super-search online state")

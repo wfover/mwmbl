@@ -55,3 +55,16 @@ def update(rewards: dict[str, float]) -> None:
         ema = reward if prev is None else (1.0 - DECAY) * float(prev) + DECAY * float(reward)
         pipe.set(_REWARD_EMA.format(site=site), repr(float(ema)))
     pipe.execute()
+
+
+def seed_stats(means: dict[str, float]) -> int:
+    """Seed missing reward EMAs (SETNX — never clobbers live stats).
+
+    Used at startup with the per-source mean judge rewards the bundled
+    warm-start model was trained against. Returns the number seeded.
+    """
+    pipe = _get_redis().pipeline()
+    for site, mean in means.items():
+        pipe.setnx(_REWARD_EMA.format(site=site), repr(float(mean)))
+    results = pipe.execute()
+    return sum(1 for ok in results if ok)

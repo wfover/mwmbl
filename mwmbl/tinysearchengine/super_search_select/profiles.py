@@ -103,3 +103,20 @@ def get_query_vectors(query: str) -> tuple[np.ndarray, np.ndarray]:
     pipe.set(_QVEC_CNG.format(key=key), vectors.to_bytes(cng), ex=ttl)
     pipe.execute()
     return bow, cng
+
+
+def seed_profiles(seeds: dict[str, tuple[np.ndarray, np.ndarray]]) -> int:
+    """Seed missing content profiles (SETNX — never clobbers a live profile).
+
+    Used at startup to initialise cold sites from the bundled warm-start
+    artifact's batch profiles, so the xgb model's cosine features see the
+    distribution it was trained on from the first request. Live traffic then
+    blends over the seed via ``update_profile``'s decaying mean. Returns the
+    number of sites actually seeded.
+    """
+    pipe = _get_redis().pipeline()
+    for site, (bow, cng) in seeds.items():
+        pipe.setnx(_PROFILE_BOW.format(site=site), vectors.to_bytes(bow))
+        pipe.setnx(_PROFILE_CNG.format(site=site), vectors.to_bytes(cng))
+    results = pipe.execute()
+    return sum(1 for i in range(0, len(results), 2) if results[i])

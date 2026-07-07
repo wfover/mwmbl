@@ -97,10 +97,15 @@ def test_build_training_data_from_matrix():
     mask[2, 0] = False
     matrix = RewardMatrix(queries=["q1", "q2", "q3"], sources=["b", "a"],
                           feature_names=list(FEATURE_NAMES), X=X, R=R, mask=mask)
-    Xf, y, vocab = xgb_model.build_training_data_from_matrix(matrix)
+    Xf, y, vocab, means = xgb_model.build_training_data_from_matrix(matrix)
     assert vocab == ["a", "b"]
     assert Xf.shape == (5, NUM_FEATURES + 2)
     assert set(y.tolist()) == {1.0, 0.0, 0.5, 0.2, 0.9}
+    # Per-source mean reward over masked cells, injected into the ema slot.
+    assert means["b"] == pytest.approx(0.75)          # (1.0 + 0.5) / 2
+    assert means["a"] == pytest.approx((0.0 + 0.2 + 0.9) / 3)
+    ema_i = FEATURE_NAMES.index("contribution_ema")
+    assert set(np.round(Xf[:, ema_i], 6)) == {0.75, round((0.0 + 0.2 + 0.9) / 3, 6)}
 
 
 def test_matrix_with_mismatched_features_raises():
@@ -282,6 +287,61 @@ def test_rstats_ema_tracks_rewards(fake_rstats_redis):
     ema = rstats.get_stats(["a", "b"])
     assert ema["a"].contribution_ema == pytest.approx(1.0 - rstats.DECAY)
     assert ema["b"].contribution_ema == pytest.approx(0.0)
+
+
+def test_seed_stats_never_clobbers_live_values(fake_rstats_redis):
+    rstats.update({"live": 0.9})
+    seeded = rstats.seed_stats({"live": 0.1, "cold": 0.5})
+    assert seeded == 1
+    got = rstats.get_stats(["live", "cold"])
+    assert got["live"].contribution_ema == pytest.approx(0.9)
+    assert got["cold"].contribution_ema == pytest.approx(0.5)
+
+
+def test_seed_profiles_never_clobbers_live_values(fake_rstats_redis, monkeypatch):
+    from mwmbl.tinysearchengine.indexer import Document
+
+    monkeypatch.setattr(profiles, "_redis", fake_rstats_redis)
+    profiles.update_profile("live", [Document(title="postgres sql", url="https://x/1", extract="db")])
+    live_before, _ = profiles.get_profile("live")
+
+    seed_vec = np.ones(64, dtype=np.float32) / 8.0
+    seeded = profiles.seed_profiles({"live": (seed_vec, seed_vec),
+                                     "cold": (seed_vec, seed_vec)})
+    assert seeded == 1
+    live_after, _ = profiles.get_profile("live")
+    assert np.allclose(live_after, live_before)          # untouched
+    cold_bow, cold_cng = profiles.get_profile("cold")
+    assert np.allclose(cold_bow, seed_vec) and np.allclose(cold_cng, seed_vec)
+
+
+def test_seed_online_state_from_bundled_artifact(fake_rstats_redis, tmp_path, monkeypatch):
+    monkeypatch.setattr(profiles, "_redis", fake_rstats_redis)
+    monkeypatch.setattr(xgb_model, "BUNDLED_DIR", tmp_path)
+    _trained_model(tmp_path)  # writes model.json + meta.json (no reward means)
+    # add reward means + profiles to the artifact
+    import json as _json
+    meta_path = tmp_path / xgb_model.META_FILE
+    meta = _json.loads(meta_path.read_text())
+    meta["source_reward_means"] = {"github": 0.6, "recipes": 0.3}
+    meta_path.write_text(_json.dumps(meta))
+    vec = np.ones(64, dtype=np.float32) / 8.0
+    xgb_model.save_profiles({"github": (vec, vec), "recipes": (vec, vec)}, tmp_path)
+
+    seeded = xgb_model.seed_online_state()
+    assert seeded == {"profiles": 2, "reward_emas": 2}
+    assert rstats.get_stats(["github"])["github"].contribution_ema == pytest.approx(0.6)
+    assert profiles.get_profile("recipes")[0] is not None
+    # idempotent: second run seeds nothing new
+    assert xgb_model.seed_online_state() == {"profiles": 0, "reward_emas": 0}
+
+
+def test_profiles_artifact_roundtrip(tmp_path):
+    bow = np.arange(64, dtype=np.float32) / 100.0
+    cng = np.ones(64, dtype=np.float32)
+    xgb_model.save_profiles({"a": (bow, cng)}, tmp_path)
+    loaded = xgb_model.load_profiles(tmp_path)
+    assert np.allclose(loaded["a"][0], bow) and np.allclose(loaded["a"][1], cng)
 
 
 def test_rstats_feeds_selection_features(fake_rstats_redis, monkeypatch):

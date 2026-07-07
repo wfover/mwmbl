@@ -101,19 +101,27 @@ routing, is the objective.
   finding; keep a small eps (0.05–0.1) in production anyway to de-bias the
   training log. `SUPER_SEARCH_XGB_EPSILON` defaults to 0.1.
 
-## Warm-start artifact
+## Warm-start artifact + Redis seed data
 
 `mwmbl/tinysearchengine/super_search_select/artifacts/xgb/` (committed,
-~1 MB): trained on all 35,125 judge-matrix pairs, train RMSE 0.097,
-`reward_kind=judge`. Served whenever the runtime dir
-(`SUPER_SEARCH_XGB_MODEL_DIR`) has no artifact yet; the daily
-`retrain_super_search_xgb` background task replaces it with a model trained
-on real impressions once ≥2000 pairs accumulate.
+~1.1 MB): trained on all 35,125 judge-matrix pairs with per-source mean
+reward injected into the `contribution_ema` column (train RMSE 0.093,
+`reward_kind=judge` — the model actually splits on the EMA feature, gain
+1.06). Served whenever the runtime dir (`SUPER_SEARCH_XGB_MODEL_DIR`) has no
+artifact yet; the daily `retrain_super_search_xgb` background task replaces
+it with a model trained on real impressions once ≥2000 pairs accumulate.
 
-End-to-end check: with `SUPER_SEARCH_SELECTION_MODE=xgb` the bundled model
-loads, selects 10 sources, and records 18-dim feature vectors. On real
-matrix feature rows the model's top sources closely track the oracle's.
-Caveat: with cold Redis (no content profiles, no reward EMAs) all
-query-dependent features are zero and selection degenerates toward
-per-source priors — expected, and self-correcting as profiles/EMAs warm up
-with traffic.
+The artifact also carries the Redis seed data matching what the model
+trained against: `profiles.npz` (batch content profiles for the 119 sources
+that returned docs during the judge-matrix fetch) and
+`meta.json["source_reward_means"]` (139 per-source mean judge rewards). At
+startup `xgb_model.seed_online_state()` SETNX-seeds both into Redis — never
+overwriting live values — so serve-time `cos_*`/`contribution_ema` features
+match the training distribution from the first request, and a Redis wipe
+self-heals on the next startup. Live traffic then blends over the seeds via
+the decaying-mean profile updates and reward-EMA updates.
+
+End-to-end check: the bundled model loads, selects 10 sources, records
+18-dim feature vectors; on real matrix feature rows its top sources closely
+track the oracle's; seeding a cold Redis is idempotent
+({profiles: 119, reward_emas: 139} then {0, 0}).
