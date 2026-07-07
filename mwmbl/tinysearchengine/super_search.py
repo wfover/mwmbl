@@ -48,7 +48,6 @@ from mwmbl.tinysearchengine.ltr_rank import score_documents
 from mwmbl.tinysearchengine.mmr_rank import mmr_rerank
 from mwmbl.tinysearchengine.rank import score_result_whole
 from mwmbl.tinysearchengine.super_search_sources import SOURCES
-from mwmbl.tinysearchengine.super_search_select import bandit as ss_bandit
 from mwmbl.tinysearchengine.super_search_select import rstats as ss_rstats
 from mwmbl.tinysearchengine.super_search_select import judge as ss_judge
 from mwmbl.tinysearchengine.super_search_select import profiles as ss_profiles
@@ -555,7 +554,9 @@ async def _record_rewards(ctx: SelectionContext, last_results_key: list) -> None
         logger.exception("super-search failed to record rewards")
     try:
         # Per-source reward EMA: the online stat behind the contribution_ema
-        # feature (aggregate per source, nothing query-derived).
+        # feature (aggregate per source, nothing query-derived). Together with
+        # the impression log this is the policy's whole update — the xgb model
+        # itself retrains in batch.
         await asyncio.to_thread(ss_rstats.update, rewards)
     except Exception:
         logger.exception("super-search failed to update reward stats")
@@ -567,13 +568,6 @@ async def _record_rewards(ctx: SelectionContext, last_results_key: list) -> None
         await asyncio.to_thread(_enqueue_discovered_urls, ctx)
     except Exception:
         logger.exception("super-search failed to enqueue discovered urls")
-    # Only the per-arm LinTS bandit needs a per-request update; the xgb policy
-    # learns from the impression log in batch.
-    if getattr(settings, "SUPER_SEARCH_SELECTION_MODE", "cosine") == "lints":
-        try:
-            await asyncio.to_thread(ss_bandit.update, ctx.features, rewards)
-        except Exception:
-            logger.exception("super-search failed to update bandit")
 
 
 async def _run_pipeline(
@@ -613,8 +607,8 @@ async def _run_pipeline(
         follow_redirects=True,
         headers={"User-Agent": HTTP_USER_AGENT},
     ) as client:
-        # Select a subset of sources to query (cosine/bandit policy) rather than
-        # fanning out to every registered source.
+        # Select a subset of sources to query (xgb contextual-bandit policy)
+        # rather than fanning out to every registered source.
         sources_to_query = getattr(settings, "SUPER_SEARCH_SOURCES_TO_QUERY", len(SOURCES))
         ctx.candidates = list(SOURCES.keys())
         selected = await asyncio.to_thread(

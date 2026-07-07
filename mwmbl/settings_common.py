@@ -296,20 +296,11 @@ SUPER_SEARCH_JUDGE_MODEL_DIR = os.environ.get(
     str(Path(__file__).parent.parent / "devdata" / "judge_train" / "models"
         / "minilm-both-v1" / "onnx"))
 
-# Super Search source selection (bandit / cosine profiles)
+# Super Search source selection (xgb contextual bandit over cosine-profile features)
 SUPER_SEARCH_SOURCES_TO_QUERY = 10   # max sources queried per search
 SUPER_SEARCH_PROJECTION_DIM = 64     # feature-hashing / random-projection dimension
 SUPER_SEARCH_PROFILE_DECAY = 0.1     # decaying-mean weight for per-site content profiles
-SUPER_SEARCH_EXPLORE_FLOOR = 2       # guaranteed exploration slots per search
-SUPER_SEARCH_TS_EXPLORE_SCALE = 1.0  # Thompson-sampling posterior-covariance multiplier (nu)
-SUPER_SEARCH_TS_PRIOR_PRECISION = 1.0  # ridge prior precision (lambda); A0 = lambda*I
-SUPER_SEARCH_TS_NOISE_VARIANCE = 0.25  # reward noise variance (sigma^2); reward in [0,1]
 SUPER_SEARCH_QVEC_CACHE_TTL = 3600   # seconds to cache a query's projected vectors
-# Selection strategy: "cosine" (greedy top-10 baseline), "lints" (per-arm
-# Thompson sampling), or "xgb" (contextual bandit: XGBoost reward model with
-# epsilon-greedy exploration). Transitional — cosine/lints are removed once the
-# xgb policy passes the offline gate.
-SUPER_SEARCH_SELECTION_MODE = os.environ.get("SUPER_SEARCH_SELECTION_MODE", "cosine")
 SUPER_SEARCH_FORCE_INCLUDE = []      # source names always queried (high-value sources), like always_on
 
 # XGBoost contextual-bandit source model. The runtime dir receives online

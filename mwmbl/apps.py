@@ -67,11 +67,7 @@ class MwmblConfig(AppConfig):
 
         try:
             from background_task.models import Task
-            from mwmbl.background import (
-                retrain_super_search_xgb,
-                sync_search_counts,
-                sync_super_search_bandit,
-            )
+            from mwmbl.background import retrain_super_search_xgb, sync_search_counts
 
             SYNC_TASK = "mwmbl.background.sync_search_counts"
 
@@ -79,14 +75,8 @@ class MwmblConfig(AppConfig):
             if not Task.objects.filter(task_name=SYNC_TASK).exists():
                 sync_search_counts(repeat=3600, repeat_until=None)
 
-            # Persist Super Search bandit state Redis <-> Postgres once per hour.
-            BANDIT_TASK = "mwmbl.background.sync_super_search_bandit"
-            if not Task.objects.filter(task_name=BANDIT_TASK).exists():
-                sync_super_search_bandit(repeat=3600, repeat_until=None)
-
             # Retrain the Super Search xgb source model daily from the
-            # impression log (skips unless the xgb mode is live and enough
-            # pairs have accumulated).
+            # impression log (skips until enough pairs have accumulated).
             XGB_TASK = "mwmbl.background.retrain_super_search_xgb"
             if not Task.objects.filter(task_name=XGB_TASK).exists():
                 retrain_super_search_xgb(repeat=86400, repeat_until=None)

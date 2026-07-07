@@ -4,7 +4,9 @@ import numpy as np
 import pytest
 
 from mwmbl.tinysearchengine.indexer import Document
-from mwmbl.tinysearchengine.super_search_select import features, policy, profiles, rewards, vectors
+from mwmbl.tinysearchengine.super_search_select import (
+    features, policy, profiles, rewards, rstats, vectors,
+)
 from mwmbl.tinysearchengine.super_search_select.features import QueryContext, SiteStats
 from mwmbl.tinysearchengine.super_search_select.registry import SiteMeta
 from mwmbl.tinysearchengine.super_search_select.rewards import SelectionContext, compute_rewards
@@ -14,9 +16,10 @@ DIM = 64
 
 @pytest.fixture
 def fake_profile_redis(monkeypatch):
-    """Binary-safe fake Redis wired into the profiles module."""
+    """Binary-safe fake Redis wired into the profiles and rstats modules."""
     r = fakeredis.FakeRedis()  # decode_responses=False (vectors are raw bytes)
     monkeypatch.setattr(profiles, "_redis", r)
+    monkeypatch.setattr(rstats, "_redis", r)
     return r
 
 
@@ -92,16 +95,6 @@ def test_code_token_detected():
     assert not _qctx("history of rome").has_code_token
 
 
-def test_cosine_relevance_prefers_matching_profile():
-    qctx = _qctx("django database migration")
-    related = (vectors.project_bow("django orm migration schema", DIM),
-               vectors.project_char_ngrams("django orm migration schema", DIM))
-    unrelated = (vectors.project_bow("baroque opera composers", DIM),
-                 vectors.project_char_ngrams("baroque opera composers", DIM))
-    assert features.cosine_relevance(qctx, related) > features.cosine_relevance(qctx, unrelated)
-    assert features.cosine_relevance(qctx, (None, None)) == 0.0
-
-
 def test_feature_vector_uses_stats():
     meta = SiteMeta("s", "s.com", "tech")
     stats = SiteStats(contribution_ema=0.5, latency_ema=10.0, failure_rate=0.25)
@@ -129,14 +122,13 @@ def test_select_includes_always_on(fake_profile_redis, monkeypatch):
     assert len(chosen) == 5
 
 
-def test_select_prefers_relevant_warm_site(fake_profile_redis, monkeypatch):
-    monkeypatch.setattr("django.conf.settings.SUPER_SEARCH_EXPLORE_FLOOR", 0)
-    # One warm site profiled on databases; others cold.
-    for _ in range(3):
-        profiles.update_profile("db_site", [_doc("postgres database sql indexing")])
+def test_select_respects_budget_and_records_features(fake_profile_redis):
+    # Selection runs the xgb policy against the bundled warm-start artifact.
     names = ["db_site"] + [f"cold{i}" for i in range(20)]
-    chosen = policy.select_sources("sql database query", names, k=3)
-    assert "db_site" in chosen
+    ctx = SelectionContext()
+    chosen = policy.select_sources("sql database query", names, k=3, ctx=ctx)
+    assert len(chosen) == 3
+    assert set(chosen) <= set(ctx.features)
 
 
 # ---------------------------------------------------------------------------

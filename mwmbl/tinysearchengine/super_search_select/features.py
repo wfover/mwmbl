@@ -163,11 +163,3 @@ def feature_vector(
     return x
 
 
-def cosine_relevance(qctx: QueryContext, profile: tuple[np.ndarray | None, np.ndarray | None]) -> float:
-    """Greedy relevance score for the Phase-2 baseline: blended query-vs-profile cosine.
-
-    Char n-grams are weighted lower; they mainly help on morphology / rare tokens
-    where whole-word BoW misses. A site with no profile yet scores 0 (cold).
-    """
-    bow_profile, cng_profile = profile
-    return 0.7 * vectors.cosine(qctx.bow, bow_profile) + 0.3 * vectors.cosine(qctx.cng, cng_profile)

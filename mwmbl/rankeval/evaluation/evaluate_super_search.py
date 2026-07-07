@@ -1,8 +1,8 @@
 """
 Evaluate the Super Search pipeline as a RankingModel against the gold dataset.
 
-Runs the real Super Search ranking core offline: select sources (cosine baseline
-by default — see ``SUPER_SEARCH_SELECTION_MODE``), fan out to them, re-rank the union
+Runs the real Super Search ranking core offline: select sources (xgb
+contextual-bandit policy), fan out to them, re-rank the union
 with the LTR model, crawl promoted pages, follow outbound links, and MMR-diversify
 into a final ranking. Only the SSE/auth/quota/indexing/reward machinery of the
 HTTP endpoint is skipped; the ranking logic is exactly what production serves.

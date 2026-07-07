@@ -91,10 +91,12 @@ routing, is the objective.
   one strength (home-source recall) does not convert into reward.
 - **xgb ≥ LinTS on the judge objective** (holdout +0.036 coverage, replay
   +0.004–0.039), **LinTS > xgb on the old survival matrix** (0.849 vs 0.785).
-  Since the survival reward is the circular metric the judge pivot replaced,
-  the judge results should carry the decision, but the old-eval gate as
-  originally stated (beat LinTS on the old matrices too) is NOT met — flagged
-  for an explicit call before deleting the LinTS strategy.
+  Decision (user call, 2026-07-07): the survival reward relies on an LTR
+  model trained on an unrepresentative dataset and is the circular metric the
+  judge pivot replaced, so the judge results carry it — **cosine and LinTS
+  removed; xgb is the only selection policy** (`SUPER_SEARCH_SELECTION_MODE`
+  gone, `bandit.py` / `SuperSearchBanditState` / TS settings deleted,
+  migration 0028).
 - Exploration: eps=0 replays best, consistent with the earlier nu≈0.05
   finding; keep a small eps (0.05–0.1) in production anyway to de-bias the
   training log. `SUPER_SEARCH_XGB_EPSILON` defaults to 0.1.

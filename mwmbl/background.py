@@ -89,57 +89,17 @@ def copy_indexes_continuously():
 # ---------------------------------------------------------------------------
 
 @background(schedule=0)
-def sync_super_search_bandit():
-    """Bidirectional sync of Super Search bandit state between Redis and Postgres.
-
-    Step 1 (Postgres → Redis): seed any arms missing from Redis (restores live
-    state after a Redis restart without clobbering newer in-memory updates).
-    Step 2 (Redis → Postgres): persist live arm state as a durable backup.
-    """
-    import numpy as np
-
-    from mwmbl.models import SuperSearchBanditState
-    from mwmbl.tinysearchengine.super_search_select import bandit
-
-    # Step 1: restore missing arms from Postgres.
-    pg_states = {}
-    for row in SuperSearchBanditState.objects.all():
-        d = row.dim
-        pg_states[row.site] = bandit.ArmState(
-            A=np.frombuffer(bytes(row.a), dtype=np.float64).reshape(d, d).copy(),
-            b=np.frombuffer(bytes(row.b), dtype=np.float64).copy(),
-        )
-    if pg_states:
-        bandit.seed_states(pg_states, overwrite=False)
-
-    # Step 2: persist live Redis state back to Postgres.
-    for site, state in bandit.export_all().items():
-        SuperSearchBanditState.objects.update_or_create(
-            site=site,
-            defaults={
-                "dim": int(state.b.shape[0]),
-                "a": state.A.astype(np.float64).tobytes(),
-                "b": state.b.astype(np.float64).tobytes(),
-            },
-        )
-
-
-@background(schedule=0)
 def retrain_super_search_xgb():
     """Daily batch retrain of the Super Search xgb source model.
 
     The impression log is the contextual bandit's memory: this folds the last
     training window of logged (features, judge-reward) pairs into a fresh
     XGBoost artifact, which serving processes hot-reload via its mtime. Skips
-    (with a log line) when the mode isn't xgb or too few pairs have
-    accumulated; training/IO errors propagate so failures are visible.
+    (with a log line) when too few pairs have accumulated; training/IO errors
+    propagate so failures are visible.
     """
     from mwmbl.tinysearchengine.super_search_select import xgb_model
 
-    if settings.SUPER_SEARCH_SELECTION_MODE != "xgb":
-        logger.info("super-search xgb retrain skipped: selection mode is %s",
-                    settings.SUPER_SEARCH_SELECTION_MODE)
-        return
     metrics = xgb_model.train_and_save_from_impressions(
         window_days=settings.SUPER_SEARCH_XGB_TRAIN_WINDOW_DAYS,
         min_rows=settings.SUPER_SEARCH_XGB_MIN_TRAIN_ROWS,

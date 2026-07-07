@@ -209,11 +209,10 @@ def test_get_model_hot_reloads_after_retrain(tmp_path, monkeypatch):
 
 @pytest.fixture
 def xgb_policy_env(tmp_path, monkeypatch):
-    """xgb selection mode with a toy artifact trained over the policy's sources."""
+    """Policy environment with a toy artifact trained over the policy's sources."""
     r = fakeredis.FakeRedis()
     monkeypatch.setattr(profiles, "_redis", r)
     monkeypatch.setattr(rstats, "_redis", r)
-    monkeypatch.setattr("django.conf.settings.SUPER_SEARCH_SELECTION_MODE", "xgb")
     monkeypatch.setattr("django.conf.settings.SUPER_SEARCH_XGB_MODEL_DIR", str(tmp_path))
     names = ["mwmbl", "hn"] + [f"site{i}" for i in range(20)]
     _trained_model(tmp_path, sources=names)
@@ -253,22 +252,11 @@ def test_policy_xgb_missing_artifact_raises(monkeypatch, tmp_path):
     r = fakeredis.FakeRedis()
     monkeypatch.setattr(profiles, "_redis", r)
     monkeypatch.setattr(rstats, "_redis", r)
-    monkeypatch.setattr("django.conf.settings.SUPER_SEARCH_SELECTION_MODE", "xgb")
     monkeypatch.setattr("django.conf.settings.SUPER_SEARCH_XGB_MODEL_DIR",
                         str(tmp_path / "empty"))
     monkeypatch.setattr(xgb_model, "BUNDLED_DIR", tmp_path / "no_bundle")
     names = ["mwmbl", "hn"] + [f"site{i}" for i in range(20)]
     with pytest.raises(FileNotFoundError):
-        policy.select_sources("some query", names, k=5)
-
-
-def test_policy_unknown_mode_raises(monkeypatch):
-    r = fakeredis.FakeRedis()
-    monkeypatch.setattr(profiles, "_redis", r)
-    monkeypatch.setattr(rstats, "_redis", r)
-    monkeypatch.setattr("django.conf.settings.SUPER_SEARCH_SELECTION_MODE", "bogus")
-    names = ["mwmbl", "hn"] + [f"site{i}" for i in range(20)]
-    with pytest.raises(ValueError, match="SUPER_SEARCH_SELECTION_MODE"):
         policy.select_sources("some query", names, k=5)
 
 

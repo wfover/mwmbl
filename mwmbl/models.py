@@ -248,20 +248,6 @@ class SuperSearchImpression(models.Model):
         ]
 
 
-class SuperSearchBanditState(models.Model):
-    """Durable backup of a source's Thompson-sampling sufficient statistics.
-
-    The live state lives in Redis; this table is synced periodically so the
-    bandit survives a Redis restart. ``a`` / ``b`` are raw float64 bytes
-    (``A`` is ``dim*dim``, ``b`` is ``dim``).
-    """
-    site = models.CharField(max_length=128, unique=True)
-    dim = models.IntegerField()
-    a = models.BinaryField()
-    b = models.BinaryField()
-    updated_at = models.DateTimeField(auto_now=True)
-
-
 class SourceProvenance(models.Model):
     """Which Super Search source a URL was (transitively) discovered from.
 
