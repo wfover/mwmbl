@@ -235,20 +235,34 @@ def simulate_xgb(matrix: RewardMatrix, k: int, epsilon: float,
     (source, reward) pairs have accumulated, selection uses the cosine
     baseline (matching how real impression logs bootstrap), after which the
     model is fit and refit every ``refit_every`` queries.
+
+    The per-source reward EMA (the online stat behind ``contribution_ema``,
+    kept in Redis in production) is recomputed along the replay and injected
+    into that feature slot at decision time, exactly as serving would see it.
     """
     from mwmbl.tinysearchengine.super_search_select import xgb_model
+    from mwmbl.tinysearchengine.super_search_select.rstats import DECAY
 
     rng = np.random.default_rng(seed)
-    Q = matrix.X.shape[0]
+    Q, S, _ = matrix.X.shape
     vocab = xgb_model.build_vocab(matrix.sources)
     vocab_index = {name: i for i, name in enumerate(vocab)}
     cos_i = matrix.feature_names.index("cos_bow")
+    ema_i = matrix.feature_names.index("contribution_ema")
 
+    ema = np.zeros(S)
+    ema_seen = np.zeros(S, dtype=bool)
     model = None
     xs: list[np.ndarray] = []
     ys: list[float] = []
     captured = 0.0
     since_fit = 0
+
+    def encode(q: int, s: int) -> np.ndarray:
+        x = matrix.X[q, s].copy()
+        x[ema_i] = ema[s]
+        return xgb_model.encode(x, matrix.sources[s], vocab_index)
+
     for q in rng.permutation(Q):
         avail = np.where(matrix.mask[q])[0]
         if avail.size == 0:
@@ -257,8 +271,7 @@ def simulate_xgb(matrix: RewardMatrix, k: int, epsilon: float,
         if model is None:
             chosen = avail[np.argsort(matrix.X[q, avail, cos_i])[::-1][:k_q]]
         else:
-            enc = np.stack([xgb_model.encode(matrix.X[q, s], matrix.sources[s], vocab_index)
-                            for s in avail])
+            enc = np.stack([encode(q, s) for s in avail])
             ranked = avail[np.argsort(model.predict(enc))[::-1]]
             n_explore = int(rng.binomial(k_q, epsilon))
             chosen = list(ranked[:k_q - n_explore])
@@ -267,9 +280,13 @@ def simulate_xgb(matrix: RewardMatrix, k: int, epsilon: float,
                 chosen += list(rng.choice(rest, size=min(n_explore, rest.size), replace=False))
             chosen = np.asarray(chosen)
         for s in chosen:
-            xs.append(xgb_model.encode(matrix.X[q, s], matrix.sources[s], vocab_index))
+            xs.append(encode(q, s))
             ys.append(float(matrix.R[q, s]))
             captured += matrix.R[q, s]
+        for s in chosen:
+            r = float(matrix.R[q, s])
+            ema[s] = r if not ema_seen[s] else (1.0 - DECAY) * ema[s] + DECAY * r
+            ema_seen[s] = True
         since_fit += 1
         if len(ys) >= min_rows and (model is None or since_fit >= refit_every):
             model = xgb_model.train(np.stack(xs), np.asarray(ys), params=params)
@@ -378,11 +395,25 @@ def evaluate_holdout(matrix: RewardMatrix, k: int = 10, test_frac: float = 0.2,
     vocab = xgb_model.build_vocab(matrix.sources)
     vocab_index = {name: i for i, name in enumerate(vocab)}
 
+    # Serve-time analog of the per-source reward EMA (rstats): each source's
+    # mean train-split reward, injected into the contribution_ema slot for
+    # both splits so the model can use the online stat it will see live.
+    ema_i = matrix.feature_names.index("contribution_ema")
+    train_mask = np.zeros(len(matrix.queries), dtype=bool)
+    train_mask[train_idx] = True
+    seen = matrix.mask & train_mask[:, None]
+    with np.errstate(invalid="ignore"):
+        source_mean = np.where(seen.sum(axis=0) > 0,
+                               (matrix.R * seen).sum(axis=0) / np.maximum(seen.sum(axis=0), 1),
+                               0.0)
+
     def rows_for(idx: np.ndarray):
         xs, ys, cells = [], [], []
         for q in idx:
             for s in np.where(matrix.mask[q])[0]:
-                xs.append(xgb_model.encode(matrix.X[q, s], matrix.sources[s], vocab_index))
+                x = matrix.X[q, s].copy()
+                x[ema_i] = source_mean[s]
+                xs.append(xgb_model.encode(x, matrix.sources[s], vocab_index))
                 ys.append(float(matrix.R[q, s]))
                 cells.append((q, s))
         return np.stack(xs), np.asarray(ys), cells

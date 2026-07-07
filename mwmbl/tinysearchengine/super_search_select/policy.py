@@ -23,10 +23,9 @@ import random
 import numpy as np
 from django.conf import settings
 
-from mwmbl.tinysearchengine.super_search_select import bandit, profiles, xgb_model
+from mwmbl.tinysearchengine.super_search_select import bandit, profiles, rstats, xgb_model
 from mwmbl.tinysearchengine.super_search_select.features import (
     QueryContext,
-    SiteStats,
     cosine_relevance,
     feature_vector,
 )
@@ -69,7 +68,8 @@ def select_sources(
     bow, cng = profiles.get_query_vectors(query)
     qctx = QueryContext.build(query, bow, cng)
     profs = profiles.get_profiles(selectable)
-    feats = {n: feature_vector(qctx, get_meta(n), profs[n]) for n in selectable}
+    stats = rstats.get_stats(selectable)
+    feats = {n: feature_vector(qctx, get_meta(n), profs[n], stats[n]) for n in selectable}
 
     mode = settings.SUPER_SEARCH_SELECTION_MODE
     if mode == "xgb":
@@ -82,13 +82,15 @@ def select_sources(
         raise ValueError(f"unknown SUPER_SEARCH_SELECTION_MODE {mode!r}")
 
     if ctx is not None:
+        pinned_stats = rstats.get_stats([n for n in pinned if n not in feats])
         for name in pinned + chosen:
             if name in feats:
                 ctx.features[name] = feats[name].tolist()
             elif name not in ctx.features:
                 # pinned sources weren't scored; compute their features too.
                 ctx.features[name] = feature_vector(
-                    qctx, get_meta(name), profs.get(name, (None, None))
+                    qctx, get_meta(name), profs.get(name, (None, None)),
+                    pinned_stats.get(name),
                 ).tolist()
 
     return pinned + chosen
@@ -143,7 +145,8 @@ def _record_features(ctx: SelectionContext, query: str, names: list[str]) -> Non
     bow, cng = profiles.get_query_vectors(query)
     qctx = QueryContext.build(query, bow, cng)
     profs = profiles.get_profiles(names)
+    stats = rstats.get_stats(names)
     for name in names:
         ctx.features[name] = feature_vector(
-            qctx, get_meta(name), profs.get(name, (None, None)), SiteStats()
+            qctx, get_meta(name), profs.get(name, (None, None)), stats.get(name)
         ).tolist()

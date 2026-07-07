@@ -3,7 +3,7 @@ import fakeredis
 import numpy as np
 import pytest
 
-from mwmbl.tinysearchengine.super_search_select import bandit, policy, profiles
+from mwmbl.tinysearchengine.super_search_select import bandit, policy, profiles, rstats
 from mwmbl.tinysearchengine.super_search_select.features import NUM_FEATURES
 from mwmbl.tinysearchengine.super_search_select.rewards import SelectionContext
 
@@ -110,6 +110,7 @@ def test_policy_bandit_branch_selects_and_records_features(monkeypatch):
     r = fakeredis.FakeRedis()
     monkeypatch.setattr(bandit, "_redis", r)
     monkeypatch.setattr(profiles, "_redis", r)
+    monkeypatch.setattr(rstats, "_redis", r)
     monkeypatch.setattr("django.conf.settings.SUPER_SEARCH_SELECTION_MODE", "lints")
 
     names = ["mwmbl", "hn"] + [f"site{i}" for i in range(20)]

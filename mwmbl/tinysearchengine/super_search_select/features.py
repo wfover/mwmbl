@@ -130,8 +130,9 @@ class QueryContext:
 
 @dataclass
 class SiteStats:
-    """Online per-site stats used as features (read from Redis; defaults for cold sites)."""
-    contribution_ema: float = 0.0   # mean fraction of results surviving into top-K
+    """Online per-site stats used as features (read from Redis via ``rstats``;
+    defaults for cold sites)."""
+    contribution_ema: float = 0.0   # EMA of the source's per-request reward (judge score)
     latency_ema: float = 0.0        # mean response time, seconds
     failure_rate: float = 0.0       # fraction of recent queries that errored/timed out
 

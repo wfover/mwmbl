@@ -5,7 +5,7 @@ import fakeredis
 import numpy as np
 import pytest
 
-from mwmbl.tinysearchengine.super_search_select import policy, profiles, xgb_model
+from mwmbl.tinysearchengine.super_search_select import policy, profiles, rstats, xgb_model
 from mwmbl.tinysearchengine.super_search_select.evaluation import RewardMatrix
 from mwmbl.tinysearchengine.super_search_select.features import (
     FEATURE_NAMES,
@@ -210,7 +210,9 @@ def test_get_model_hot_reloads_after_retrain(tmp_path, monkeypatch):
 @pytest.fixture
 def xgb_policy_env(tmp_path, monkeypatch):
     """xgb selection mode with a toy artifact trained over the policy's sources."""
-    monkeypatch.setattr(profiles, "_redis", fakeredis.FakeRedis())
+    r = fakeredis.FakeRedis()
+    monkeypatch.setattr(profiles, "_redis", r)
+    monkeypatch.setattr(rstats, "_redis", r)
     monkeypatch.setattr("django.conf.settings.SUPER_SEARCH_SELECTION_MODE", "xgb")
     monkeypatch.setattr("django.conf.settings.SUPER_SEARCH_XGB_MODEL_DIR", str(tmp_path))
     names = ["mwmbl", "hn"] + [f"site{i}" for i in range(20)]
@@ -248,7 +250,9 @@ def test_policy_xgb_full_explore_still_valid(xgb_policy_env, monkeypatch):
 
 
 def test_policy_xgb_missing_artifact_raises(monkeypatch, tmp_path):
-    monkeypatch.setattr(profiles, "_redis", fakeredis.FakeRedis())
+    r = fakeredis.FakeRedis()
+    monkeypatch.setattr(profiles, "_redis", r)
+    monkeypatch.setattr(rstats, "_redis", r)
     monkeypatch.setattr("django.conf.settings.SUPER_SEARCH_SELECTION_MODE", "xgb")
     monkeypatch.setattr("django.conf.settings.SUPER_SEARCH_XGB_MODEL_DIR",
                         str(tmp_path / "empty"))
@@ -259,11 +263,48 @@ def test_policy_xgb_missing_artifact_raises(monkeypatch, tmp_path):
 
 
 def test_policy_unknown_mode_raises(monkeypatch):
-    monkeypatch.setattr(profiles, "_redis", fakeredis.FakeRedis())
+    r = fakeredis.FakeRedis()
+    monkeypatch.setattr(profiles, "_redis", r)
+    monkeypatch.setattr(rstats, "_redis", r)
     monkeypatch.setattr("django.conf.settings.SUPER_SEARCH_SELECTION_MODE", "bogus")
     names = ["mwmbl", "hn"] + [f"site{i}" for i in range(20)]
     with pytest.raises(ValueError, match="SUPER_SEARCH_SELECTION_MODE"):
         policy.select_sources("some query", names, k=5)
+
+
+# ---------------------------------------------------------------------------
+# Online per-source reward EMA (rstats -> contribution_ema feature)
+# ---------------------------------------------------------------------------
+
+@pytest.fixture
+def fake_rstats_redis(monkeypatch):
+    r = fakeredis.FakeRedis()
+    monkeypatch.setattr(rstats, "_redis", r)
+    return r
+
+
+def test_rstats_cold_source_is_zero(fake_rstats_redis):
+    assert rstats.get_stats(["never_seen"])["never_seen"].contribution_ema == 0.0
+
+
+def test_rstats_ema_tracks_rewards(fake_rstats_redis):
+    rstats.update({"a": 1.0, "b": 0.0})
+    assert rstats.get_stats(["a"])["a"].contribution_ema == pytest.approx(1.0)
+    rstats.update({"a": 0.0})
+    ema = rstats.get_stats(["a", "b"])
+    assert ema["a"].contribution_ema == pytest.approx(1.0 - rstats.DECAY)
+    assert ema["b"].contribution_ema == pytest.approx(0.0)
+
+
+def test_rstats_feeds_selection_features(fake_rstats_redis, monkeypatch):
+    monkeypatch.setattr(profiles, "_redis", fake_rstats_redis)
+    rstats.update({"site0": 0.8})
+    ema_i = FEATURE_NAMES.index("contribution_ema")
+    ctx = SelectionContext()
+    names = ["mwmbl", "hn"] + [f"site{i}" for i in range(20)]
+    policy.select_sources("some query", names, k=len(names), ctx=ctx)  # small-fanout path
+    assert ctx.features["site0"][ema_i] == pytest.approx(0.8)
+    assert ctx.features["site1"][ema_i] == 0.0
 
 
 # ---------------------------------------------------------------------------

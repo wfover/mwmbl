@@ -49,6 +49,7 @@ from mwmbl.tinysearchengine.mmr_rank import mmr_rerank
 from mwmbl.tinysearchengine.rank import score_result_whole
 from mwmbl.tinysearchengine.super_search_sources import SOURCES
 from mwmbl.tinysearchengine.super_search_select import bandit as ss_bandit
+from mwmbl.tinysearchengine.super_search_select import rstats as ss_rstats
 from mwmbl.tinysearchengine.super_search_select import judge as ss_judge
 from mwmbl.tinysearchengine.super_search_select import profiles as ss_profiles
 from mwmbl.tinysearchengine.super_search_select.policy import select_sources
@@ -552,6 +553,12 @@ async def _record_rewards(ctx: SelectionContext, last_results_key: list) -> None
         await asyncio.to_thread(log_impression, ctx, rewards)
     except Exception:
         logger.exception("super-search failed to record rewards")
+    try:
+        # Per-source reward EMA: the online stat behind the contribution_ema
+        # feature (aggregate per source, nothing query-derived).
+        await asyncio.to_thread(ss_rstats.update, rewards)
+    except Exception:
+        logger.exception("super-search failed to update reward stats")
     try:
         await asyncio.to_thread(record_source_provenance, ctx)
     except Exception:
