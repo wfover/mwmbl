@@ -371,6 +371,7 @@ async def _call_source(name: str, fn, client: httpx.AsyncClient, query: str, lim
 async def _follow_links(
     parent: Document, query: str, emit, all_docs: list[Document],
     last_results_key: list, lock: asyncio.Lock, ctx: SelectionContext,
+    judge_worker: "_JudgeWorker | None" = None,
 ) -> None:
     """Crawl the parent URL, score its outbound links, and collect the best for final ranking."""
     max_links = settings.SUPER_SEARCH_MAX_LINKS_PER_PAGE
@@ -398,7 +399,8 @@ async def _follow_links(
         all_docs.append(Document(title=parent_title, url=parent.url, extract=parent_extract))
 
     if not raw_links:
-        await _emit_final_results(query, all_docs, emit, last_results_key, lock, ctx)
+        await _emit_final_results(query, all_docs, emit, last_results_key, lock, ctx,
+                                  judge_worker=judge_worker)
         return
 
     terms = tokenize(query)
@@ -434,7 +436,8 @@ async def _follow_links(
             if parent_source:
                 ctx.record_results(parent_source, [proxy_doc.url])
 
-    await _emit_final_results(query, all_docs, emit, last_results_key, lock, ctx)
+    await _emit_final_results(query, all_docs, emit, last_results_key, lock, ctx,
+                              judge_worker=judge_worker)
 
 
 def _judge_score_docs(query: str, docs: list[Document]) -> list[float] | None:
@@ -445,9 +448,94 @@ def _judge_score_docs(query: str, docs: list[Document]) -> list[float] | None:
     return judge.score(query, [ss_judge.doc_text(d.title, d.extract) for d in docs])
 
 
+class _JudgeWorker:
+    """Judge-scores docs incrementally as sources return them.
+
+    A single consumer task micro-batches queued docs into `_judge_score_docs`
+    calls off the event loop, accumulating url→score into ctx.judge_scores.
+    Progressive frames can then rank already-judged docs with the judge instead
+    of the LTR model, and the final frame only has to score stragglers rather
+    than the whole pool in one end-of-pipeline lump. One task means at most one
+    ONNX inference at a time, so no extra locking is needed around the judge.
+    """
+
+    def __init__(self, query: str, ctx: SelectionContext):
+        self._query = query
+        self._ctx = ctx
+        self._queue: asyncio.Queue[Document] = asyncio.Queue()
+        self._enqueued: set[str] = set()
+        self.unavailable = False
+        self._task = asyncio.create_task(self._run())
+
+    def submit(self, docs: list[Document]) -> None:
+        """Queue docs for scoring; already-submitted URLs are skipped."""
+        if self.unavailable or self._task.done():
+            return
+        for doc in docs:
+            if doc.url and doc.url not in self._enqueued:
+                self._enqueued.add(doc.url)
+                self._queue.put_nowait(doc)
+
+    async def _run(self) -> None:
+        while True:
+            batch = [await self._queue.get()]
+            while len(batch) < ss_judge.BATCH_SIZE:
+                try:
+                    batch.append(self._queue.get_nowait())
+                except asyncio.QueueEmpty:
+                    break
+            scores = await asyncio.to_thread(_judge_score_docs, self._query, batch)
+            if scores is None:
+                self.unavailable = True
+                return
+            self._ctx.judge_scores.update(zip((d.url for d in batch), scores))
+
+    async def aclose(self) -> None:
+        """Stop the worker; idempotent. Unscored docs become final-frame stragglers."""
+        if not self._task.done():
+            self._task.cancel()
+        try:
+            await self._task
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            logger.exception("super-search judge worker failed")
+
+
+async def _hybrid_scores(query: str, unique: list[Document], ctx: SelectionContext) -> list[float]:
+    """Judge scores where available, LTR for the not-yet-judged remainder.
+
+    Both are [0, 1] probabilities but calibrated differently, so judged and
+    unjudged docs can interleave imperfectly for a frame or two; each frame
+    converges toward the fully judged ranking.
+    """
+    judged = ctx.judge_scores
+    unjudged = [d for d in unique if d.url not in judged]
+    ltr_by_url: dict[str, float] = {}
+    if unjudged:
+        ltr_scores = await asyncio.to_thread(score_documents, ltr_model, query, unjudged)
+        ltr_by_url = dict(zip((d.url for d in unjudged), ltr_scores))
+    return [judged.get(d.url, ltr_by_url.get(d.url, 0.0)) for d in unique]
+
+
+async def _final_judge_scores(
+    query: str, unique: list[Document], ctx: SelectionContext, judge_worker: "_JudgeWorker",
+) -> list[float] | None:
+    """Close the worker and judge only the docs it hasn't already scored."""
+    await judge_worker.aclose()
+    stragglers = [d for d in unique if d.url not in ctx.judge_scores]
+    if stragglers:
+        scores = await asyncio.to_thread(_judge_score_docs, query, stragglers)
+        if scores is not None:
+            ctx.judge_scores.update(zip((d.url for d in stragglers), scores))
+        elif not ctx.judge_scores:
+            return None  # judge unavailable end-to-end: caller falls back to LTR
+    return [ctx.judge_scores.get(d.url, 0.0) for d in unique]
+
+
 async def _emit_final_results(
     query: str, all_docs: list[Document], emit, last_results_key: list, lock: asyncio.Lock,
-    ctx: SelectionContext, use_judge: bool = False,
+    ctx: SelectionContext, use_judge: bool = False, judge_worker: "_JudgeWorker | None" = None,
 ) -> None:
     terms = tokenize(query)
     final_limit = getattr(settings, "SUPER_SEARCH_FINAL_RESULTS_LIMIT", 100)
@@ -476,9 +564,17 @@ async def _emit_final_results(
         # scores double as the bandit's per-source reward signal.
         final_scores = None
         if use_judge:
-            final_scores = await asyncio.to_thread(_judge_score_docs, query, unique)
-            if final_scores is not None:
-                ctx.judge_scores = dict(zip((doc.url for doc in unique), final_scores))
+            if judge_worker is not None:
+                final_scores = await _final_judge_scores(query, unique, ctx, judge_worker)
+            else:
+                final_scores = await asyncio.to_thread(_judge_score_docs, query, unique)
+                if final_scores is not None:
+                    ctx.judge_scores = dict(zip((doc.url for doc in unique), final_scores))
+        elif judge_worker is not None and not judge_worker.unavailable:
+            # Progressive frame: feed the incremental judge and rank with
+            # whatever it has scored so far, LTR for the rest.
+            judge_worker.submit(unique)
+            final_scores = await _hybrid_scores(query, unique, ctx)
         if final_scores is None:
             final_scores = await asyncio.to_thread(score_documents, ltr_model, query, unique)
         ranked = sorted(zip(unique, final_scores), key=lambda x: -x[1])[:final_limit]
@@ -572,7 +668,7 @@ async def _record_rewards(ctx: SelectionContext, last_results_key: list) -> None
 
 async def _run_pipeline(
     query: str, emit, all_docs: list[Document], last_results_key: list, lock: asyncio.Lock,
-    ctx: SelectionContext,
+    ctx: SelectionContext, judge_worker: "_JudgeWorker | None" = None,
 ) -> None:
     per_source_limit = settings.SUPER_SEARCH_RESULTS_PER_SOURCE
     ctx.per_source_limit = per_source_limit
@@ -647,10 +743,11 @@ async def _run_pipeline(
                 if _maybe_promote(doc, score):
                     await emit("result_promoted", _result_payload(doc, score, name, "direct"))
                     secondary.append(
-                        asyncio.create_task(_follow_links(doc, query, emit, all_docs, last_results_key, lock, ctx))
+                        asyncio.create_task(_follow_links(doc, query, emit, all_docs, last_results_key, lock, ctx, judge_worker))
                     )
             if all_docs:
-                await _emit_final_results(query, all_docs, emit, last_results_key, lock, ctx)
+                await _emit_final_results(query, all_docs, emit, last_results_key, lock, ctx,
+                                          judge_worker=judge_worker)
 
         if secondary:
             results = await asyncio.gather(*secondary, return_exceptions=True)
@@ -672,6 +769,10 @@ async def _sse_stream(query: str, monthly_usage: int, monthly_limit: int):
     last_results_key: list = [None]
     results_lock = asyncio.Lock()
     selection_ctx = SelectionContext()
+    # Created here rather than in _run_pipeline so the deadline's wait_for
+    # cannot cancel it: on timeout the accumulated scores survive and the
+    # judged final frame only has stragglers left to score.
+    judge_worker = _JudgeWorker(query, selection_ctx)
 
     async def emit(event_type: str, data: Any) -> None:
         await queue.put((event_type, data))
@@ -680,7 +781,8 @@ async def _sse_stream(query: str, monthly_usage: int, monthly_limit: int):
         nonlocal reason, pages_indexed
         try:
             await asyncio.wait_for(
-                _run_pipeline(query, emit, all_docs, last_results_key, results_lock, selection_ctx),
+                _run_pipeline(query, emit, all_docs, last_results_key, results_lock, selection_ctx,
+                              judge_worker),
                 timeout=settings.SUPER_SEARCH_DEADLINE_SECONDS,
             )
         except asyncio.TimeoutError:
@@ -693,15 +795,19 @@ async def _sse_stream(query: str, monthly_usage: int, monthly_limit: int):
             reason = "error"
             await queue.put(("error", ErrorEvent(message=str(e))))
         finally:
-            if reason in ("complete", "timed_out"):
-                try:
-                    await _emit_final_results(query, all_docs, emit, last_results_key,
-                                              results_lock, selection_ctx, use_judge=True)
-                except Exception:
-                    logger.exception("super-search failed to emit final results")
-                pages_indexed = await _index_results(query, all_docs)
-                await _record_rewards(selection_ctx, last_results_key)
-            await queue.put(_SENTINEL)
+            try:
+                if reason in ("complete", "timed_out"):
+                    try:
+                        await _emit_final_results(query, all_docs, emit, last_results_key,
+                                                  results_lock, selection_ctx, use_judge=True,
+                                                  judge_worker=judge_worker)
+                    except Exception:
+                        logger.exception("super-search failed to emit final results")
+                    pages_indexed = await _index_results(query, all_docs)
+                    await _record_rewards(selection_ctx, last_results_key)
+            finally:
+                await judge_worker.aclose()
+                await queue.put(_SENTINEL)
 
     task = asyncio.create_task(producer())
 
@@ -731,6 +837,7 @@ async def _sse_stream(query: str, monthly_usage: int, monthly_limit: int):
                 await task
             except (asyncio.CancelledError, Exception):
                 pass
+        await judge_worker.aclose()
 
 
 # ---------------------------------------------------------------------------
