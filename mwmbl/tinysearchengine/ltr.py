@@ -147,7 +147,7 @@ class RustXGBPipeline(BaseEstimator, RegressorMixin):
         subset['score'] = subset['score'].fillna(0.0)
         return subset.to_dict('records')
 
-    def fit(self, X: DataFrame, y) -> 'RustXGBPipeline':
+    def fit(self, X: DataFrame, y, sample_weight=None) -> 'RustXGBPipeline':
         """
         Train the XGBoost model.
 
@@ -155,6 +155,7 @@ class RustXGBPipeline(BaseEstimator, RegressorMixin):
         ----------
         X : DataFrame with columns query, url, title, extract, score
         y : array-like of float relevance labels
+        sample_weight : optional array-like of per-row weights
         """
         import time
         t0 = time.time()
@@ -163,11 +164,12 @@ class RustXGBPipeline(BaseEstimator, RegressorMixin):
         print(f"[RustXGBPipeline.fit] Conversion done in {time.time() - t0:.2f}s. Converting labels...", flush=True)
         t1 = time.time()
         labels = list(np.asarray(y, dtype=np.float32))
+        weights = None if sample_weight is None else list(np.asarray(sample_weight, dtype=np.float32))
         print(f"[RustXGBPipeline.fit] Labels ready in {time.time() - t1:.2f}s. Getting inner pipeline...", flush=True)
         t2 = time.time()
         print(f"[RustXGBPipeline.fit] Inner pipeline ready in {time.time() - t2:.2f}s. Calling Rust fit()...", flush=True)
         t3 = time.time()
-        self._inner.fit(records, labels)
+        self._inner.fit(records, labels, weights)
         print(f"[RustXGBPipeline.fit] Rust fit() completed in {time.time() - t3:.2f}s (total: {time.time() - t0:.2f}s).", flush=True)
         return self
 
