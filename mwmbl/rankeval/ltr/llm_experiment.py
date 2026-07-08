@@ -20,8 +20,15 @@ rows (see load_curation_frame). Training always uses RustXGBPipeline so any
 winning model is the exact artifact that ships (Python XGB feature extraction
 is a parallel implementation, not value-verified against Rust).
 
-Evaluation gains are the raw `overall` grades (NDCG full and @10) plus
-precision@5/@10 at binary relevance overall >= 4.
+Every run reports two axes (unless --test-size 0):
+- Haiku axis: NDCG (full and @10) with the raw `overall` grades as gains plus
+  precision@5/@10 at binary relevance overall >= 4, on the held-out LLM split.
+- Human axis: pair-accuracy on a held-out query split of the judgments_export
+  preference pairs (ties scored 0.5). The two label sources disagree — models
+  trained on one regress on the other — so both numbers gate a retrain.
+
+Training frames exclude BOTH held-out query sets, so numbers are clean on both
+axes (this makes Haiku figures a shade lower than the original single-axis runs).
 
 Usage:
     uv run python -m mwmbl.rankeval.ltr.llm_experiment --mode baseline --note baseline
@@ -128,6 +135,40 @@ def load_curation_frame(weak_neg_weight: float) -> pd.DataFrame:
             'weight': min(total, CURATION_WEIGHT_CAP),
         })
     return pd.DataFrame(rows)
+
+
+def load_human_pairs() -> list[dict]:
+    """Human preference pairs with text on both sides, plus a qnorm key."""
+    with gzip.open(JUDGMENTS_EXPORT_DIR / 'pairs.jsonl.gz', 'rt') as f:
+        pairs = [json.loads(line) for line in f]
+    pairs = [p for p in pairs if all(p[s]['title'] and p[s]['extract'] for s in ('pos', 'neg'))]
+    for pair in pairs:
+        pair['qnorm'] = pair['query'].lower().strip()
+    return pairs
+
+
+def split_human_pairs(pairs: list[dict], test_size: float, split_seed: int
+                      ) -> tuple[list[dict], set[str]]:
+    """Query-level test split of the human pairs: (test pairs, test queries)."""
+    if test_size <= 0:
+        return [], set()
+    queries = np.sort(pd.unique([p['qnorm'] for p in pairs]))
+    rng = np.random.default_rng(split_seed)
+    rng.shuffle(queries)
+    test_queries = set(queries[:int(round(len(queries) * test_size))])
+    return [p for p in pairs if p['qnorm'] in test_queries], test_queries
+
+
+def pair_accuracy(model, test_pairs: list[dict]) -> tuple[float, float]:
+    """Fraction of held-out human pairs ranked pos > neg (ties count 0.5)."""
+    def rec(pair, side):
+        return {'query': pair['query'], 'url': pair[side]['url'],
+                'title': pair[side]['title'], 'extract': pair[side]['extract'], 'score': 0.0}
+
+    pos = np.array(model.predict([rec(p, 'pos') for p in test_pairs]))
+    neg = np.array(model.predict([rec(p, 'neg') for p in test_pairs]))
+    correct = np.where(pos > neg, 1.0, np.where(pos == neg, 0.5, 0.0))
+    return float(correct.mean()), float((pos == neg).mean())
 
 
 def build_training_frame(
@@ -263,8 +304,11 @@ def run():
     ext, llm = load_datasets()
     train_queries, test_queries = split_llm_queries(llm, args.test_size, args.split_seed)
     test_df = llm[llm['qnorm'].isin(test_queries)]
+    human_test_pairs, human_test_queries = split_human_pairs(
+        load_human_pairs(), args.test_size, args.split_seed)
     print(f"LLM split: {len(train_queries)} train / {len(test_queries)} test queries "
-          f"({len(test_df)} test rows)")
+          f"({len(test_df)} test rows); {len(human_test_pairs)} held-out human pairs "
+          f"({len(human_test_queries)} queries)")
 
     if args.mode == 'baseline':
         print(f"Loading model from {args.model_path}")
@@ -272,7 +316,8 @@ def run():
     else:
         curation = load_curation_frame(args.weak_neg_weight) if args.add_curation else None
         train_df = build_training_frame(
-            args.mode, ext, llm, train_queries, test_queries,
+            args.mode, ext, llm, train_queries - human_test_queries,
+            test_queries | human_test_queries,
             args.overall_threshold, args.ext_weight, args.ext_downsample, args.seed,
             curation=curation, curation_weight=args.curation_weight,
         )
@@ -289,12 +334,15 @@ def run():
         return
 
     metrics = evaluate(model, test_df)
+    accuracy, ties = pair_accuracy(model, human_test_pairs)
     print(f"\n=== {args.note} (mode={args.mode}) ===")
     print(f"queries evaluated: {metrics['queries']} (skipped {metrics['skipped']})")
     print(f"ndcg:    {metrics['ndcg']:.4f} ± {metrics['ndcg_sem']:.4f}")
     print(f"ndcg@10: {metrics['ndcg@10']:.4f}")
     print(f"p@5:     {metrics['p@5']:.4f}")
     print(f"p@10:    {metrics['p@10']:.4f}")
+    print(f"pair-acc: {accuracy:.3f} on {len(human_test_pairs)} held-out human pairs "
+          f"(ties {ties:.1%})")
 
 
 if __name__ == '__main__':
