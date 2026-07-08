@@ -9,8 +9,10 @@ RANKINGS_DATASET_TRAIN_PATH = REMOTE_DATA_DIR / 'rankings-train.csv'
 RANKINGS_DATASET_TEST_PATH = REMOTE_DATA_DIR / 'rankings-test.csv'
 
 LEARNING_TO_RANK_DATASET_PATH = DATA_DIR / 'learning-to-rank.csv.gz'
+LEARNING_TO_RANK_LLM_DATASET_PATH = DATA_DIR / 'learning-to-rank-llm.csv.gz'
 # MODEL_PATH = ROOT_DIR / "mwmbl" / "resources" / 'model.pickle'
 MODEL_PATH = DATA_DIR / 'model.pickle'
 RUST_MODEL_PATH = DATA_DIR / "model.xgb"
+CURRENT_MODEL_PATH = DATA_DIR / "model-current.xgb"
 
 URLS_PATH = Path(os.environ['HOME']) / 'data' / 'tinysearch' / 'urls.sqlite3'
