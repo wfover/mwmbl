@@ -6,7 +6,7 @@ from django.db import migrations, models
 class Migration(migrations.Migration):
 
     dependencies = [
-        ('mwmbl', '0024_supersearchimpression'),
+        ('mwmbl', '0025_supersearchimpression'),
     ]
 
     operations = [

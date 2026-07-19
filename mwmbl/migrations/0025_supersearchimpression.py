@@ -6,7 +6,7 @@ from django.db import migrations, models
 class Migration(migrations.Migration):
 
     dependencies = [
-        ('mwmbl', '0023_userbilling_cancel_at_period_end'),
+        ('mwmbl', '0024_marketingconsent'),
     ]
 
     operations = [

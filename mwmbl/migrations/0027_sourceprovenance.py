@@ -6,7 +6,7 @@ from django.db import migrations, models
 class Migration(migrations.Migration):
 
     dependencies = [
-        ('mwmbl', '0025_supersearchbanditstate'),
+        ('mwmbl', '0026_supersearchbanditstate'),
     ]
 
     operations = [
