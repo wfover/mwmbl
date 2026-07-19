@@ -15,7 +15,6 @@ import asyncio
 import copy
 import heapq
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime
 import json
 import logging
 import re
@@ -33,32 +32,19 @@ from ninja.errors import HttpError
 from pydantic import BaseModel, Field
 
 from mwmbl.crawler.retrieve import crawl_url
-from mwmbl.crawler.urls import FoundURL, URLStatus
 from mwmbl.indexer.index_batches import index_results_against_query
-from mwmbl.indexer.update_urls import _add_found_urls_to_db_and_queue
 from mwmbl.quota import (
     check_rate_limit,
     decrement_monthly_super_search,
     increment_monthly_super_search,
 )
 from mwmbl.search_auth import authenticate_user
-from mwmbl.search_setup import index_path, ltr_model, queued_batches
+from mwmbl.search_setup import index_path, ltr_model
 from mwmbl.tinysearchengine.indexer import Document
 from mwmbl.tinysearchengine.ltr_rank import score_documents
 from mwmbl.tinysearchengine.mmr_rank import mmr_rerank
 from mwmbl.tinysearchengine.rank import score_result_whole
 from mwmbl.tinysearchengine.super_search_sources import SOURCES
-from mwmbl.tinysearchengine.super_search_select import rstats as ss_rstats
-from mwmbl.tinysearchengine.super_search_select import judge as ss_judge
-from mwmbl.tinysearchengine.super_search_select import profiles as ss_profiles
-from mwmbl.tinysearchengine.super_search_select.policy import select_sources
-from mwmbl.tinysearchengine.super_search_select.rewards import (
-    SelectionContext,
-    compute_judge_rewards,
-    compute_rewards,
-    log_impression,
-    record_source_provenance,
-)
 from mwmbl.tokenizer import tokenize
 
 logger = logging.getLogger(__name__)
@@ -98,14 +84,6 @@ async def _crawl(url: str):
     return await loop.run_in_executor(_CRAWL_EXECUTOR, crawl_url, url, _get_redis())
 
 
-async def _update_profile(name: str, docs: list[Document]) -> None:
-    """Fold a source's results into its content profile (off-thread, best-effort)."""
-    try:
-        await asyncio.to_thread(ss_profiles.update_profile, name, docs)
-    except Exception:
-        logger.exception("super-search profile update failed for %s", name)
-
-
 # ---------------------------------------------------------------------------
 # Event payload schemas
 #
@@ -134,10 +112,9 @@ class ResultItem(Schema):
                          examples=[1.8423])
     source: str = Field(
         description=(
-            "Originating Super Search source for this result (e.g. `github`) — "
-            "the source that first produced the URL, for both `result_promoted` "
-            "and final `results` items. Empty string when the source is unknown "
-            "(e.g. an inline-followed link whose parent had no recorded source)."
+            "Originating source for `result_promoted` (one of the Super Search "
+            "sources, e.g. `github`); empty string for items in the final "
+            "`results` ranking, which merges all sources."
         ),
         examples=["github", ""],
     )
@@ -370,14 +347,10 @@ async def _call_source(name: str, fn, client: httpx.AsyncClient, query: str, lim
 
 async def _follow_links(
     parent: Document, query: str, emit, all_docs: list[Document],
-    last_results_key: list, lock: asyncio.Lock, ctx: SelectionContext,
-    judge_worker: "_JudgeWorker | None" = None,
+    last_results_key: list, lock: asyncio.Lock,
 ) -> None:
     """Crawl the parent URL, score its outbound links, and collect the best for final ranking."""
     max_links = settings.SUPER_SEARCH_MAX_LINKS_PER_PAGE
-    # Inline-followed pages are surfaced by Super Search itself, so attribute
-    # them (and the parent) to the source that produced the parent result.
-    parent_source = ctx.source_by_url.get(parent.url)
 
     try:
         result = await _crawl(parent.url)
@@ -399,8 +372,7 @@ async def _follow_links(
         all_docs.append(Document(title=parent_title, url=parent.url, extract=parent_extract))
 
     if not raw_links:
-        await _emit_final_results(query, all_docs, emit, last_results_key, lock, ctx,
-                                  judge_worker=judge_worker)
+        await _emit_final_results(query, all_docs, emit, last_results_key, lock)
         return
 
     terms = tokenize(query)
@@ -433,109 +405,12 @@ async def _follow_links(
                 url=proxy_doc.url,
                 extract=c.get("extract") or "",
             ))
-            if parent_source:
-                ctx.record_results(parent_source, [proxy_doc.url])
 
-    await _emit_final_results(query, all_docs, emit, last_results_key, lock, ctx,
-                              judge_worker=judge_worker)
-
-
-def _judge_score_docs(query: str, docs: list[Document]) -> list[float] | None:
-    """Score docs with the fine-tuned relevance judge; None if it is unavailable."""
-    judge = ss_judge.get_judge()
-    if judge is None:
-        return None
-    return judge.score(query, [ss_judge.doc_text(d.title, d.extract) for d in docs])
-
-
-class _JudgeWorker:
-    """Judge-scores docs incrementally as sources return them.
-
-    A single consumer task micro-batches queued docs into `_judge_score_docs`
-    calls off the event loop, accumulating url→score into ctx.judge_scores.
-    Progressive frames can then rank already-judged docs with the judge instead
-    of the LTR model, and the final frame only has to score stragglers rather
-    than the whole pool in one end-of-pipeline lump. One task means at most one
-    ONNX inference at a time, so no extra locking is needed around the judge.
-    """
-
-    def __init__(self, query: str, ctx: SelectionContext):
-        self._query = query
-        self._ctx = ctx
-        self._queue: asyncio.Queue[Document] = asyncio.Queue()
-        self._enqueued: set[str] = set()
-        self.unavailable = False
-        self._task = asyncio.create_task(self._run())
-
-    def submit(self, docs: list[Document]) -> None:
-        """Queue docs for scoring; already-submitted URLs are skipped."""
-        if self.unavailable or self._task.done():
-            return
-        for doc in docs:
-            if doc.url and doc.url not in self._enqueued:
-                self._enqueued.add(doc.url)
-                self._queue.put_nowait(doc)
-
-    async def _run(self) -> None:
-        while True:
-            batch = [await self._queue.get()]
-            while len(batch) < ss_judge.BATCH_SIZE:
-                try:
-                    batch.append(self._queue.get_nowait())
-                except asyncio.QueueEmpty:
-                    break
-            scores = await asyncio.to_thread(_judge_score_docs, self._query, batch)
-            if scores is None:
-                self.unavailable = True
-                return
-            self._ctx.judge_scores.update(zip((d.url for d in batch), scores))
-
-    async def aclose(self) -> None:
-        """Stop the worker; idempotent. Unscored docs become final-frame stragglers."""
-        if not self._task.done():
-            self._task.cancel()
-        try:
-            await self._task
-        except asyncio.CancelledError:
-            pass
-        except Exception:
-            logger.exception("super-search judge worker failed")
-
-
-async def _hybrid_scores(query: str, unique: list[Document], ctx: SelectionContext) -> list[float]:
-    """Judge scores where available, LTR for the not-yet-judged remainder.
-
-    Both are [0, 1] probabilities but calibrated differently, so judged and
-    unjudged docs can interleave imperfectly for a frame or two; each frame
-    converges toward the fully judged ranking.
-    """
-    judged = ctx.judge_scores
-    unjudged = [d for d in unique if d.url not in judged]
-    ltr_by_url: dict[str, float] = {}
-    if unjudged:
-        ltr_scores = await asyncio.to_thread(score_documents, ltr_model, query, unjudged)
-        ltr_by_url = dict(zip((d.url for d in unjudged), ltr_scores))
-    return [judged.get(d.url, ltr_by_url.get(d.url, 0.0)) for d in unique]
-
-
-async def _final_judge_scores(
-    query: str, unique: list[Document], ctx: SelectionContext, judge_worker: "_JudgeWorker",
-) -> list[float] | None:
-    """Close the worker and judge only the docs it hasn't already scored."""
-    await judge_worker.aclose()
-    stragglers = [d for d in unique if d.url not in ctx.judge_scores]
-    if stragglers:
-        scores = await asyncio.to_thread(_judge_score_docs, query, stragglers)
-        if scores is not None:
-            ctx.judge_scores.update(zip((d.url for d in stragglers), scores))
-        elif not ctx.judge_scores:
-            return None  # judge unavailable end-to-end: caller falls back to LTR
-    return [ctx.judge_scores.get(d.url, 0.0) for d in unique]
+    await _emit_final_results(query, all_docs, emit, last_results_key, lock)
 
 
 async def _emit_final_results(
-    query: str, all_docs: list[Document], emit, last_results_key: list, lock: asyncio.Lock,
-    ctx: SelectionContext, use_judge: bool = False, judge_worker: "_JudgeWorker | None" = None,
+    query: str, all_docs: list[Document], emit, last_results_key: list, lock: asyncio.Lock
 ) -> None:
     terms = tokenize(query)
     final_limit = getattr(settings, "SUPER_SEARCH_FINAL_RESULTS_LIMIT", 100)
@@ -558,25 +433,7 @@ async def _emit_final_results(
         if not unique:
             return
 
-        # The end-of-search frame is re-ranked by the fine-tuned relevance
-        # judge when available (the LTR model anti-correlates with human
-        # curation — see devdata/judge_train/RESULTS.md); the per-URL judge
-        # scores double as the bandit's per-source reward signal.
-        final_scores = None
-        if use_judge:
-            if judge_worker is not None:
-                final_scores = await _final_judge_scores(query, unique, ctx, judge_worker)
-            else:
-                final_scores = await asyncio.to_thread(_judge_score_docs, query, unique)
-                if final_scores is not None:
-                    ctx.judge_scores = dict(zip((doc.url for doc in unique), final_scores))
-        elif judge_worker is not None and not judge_worker.unavailable:
-            # Progressive frame: feed the incremental judge and rank with
-            # whatever it has scored so far, LTR for the rest.
-            judge_worker.submit(unique)
-            final_scores = await _hybrid_scores(query, unique, ctx)
-        if final_scores is None:
-            final_scores = await asyncio.to_thread(score_documents, ltr_model, query, unique)
+        final_scores = await asyncio.to_thread(score_documents, ltr_model, query, unique)
         ranked = sorted(zip(unique, final_scores), key=lambda x: -x[1])[:final_limit]
         # Diversify with MMR (demotes, never drops, same-domain / near-duplicate
         # results) to match standard search — see MMRRanker in search_setup.py.
@@ -588,10 +445,7 @@ async def _emit_final_results(
             return
         last_results_key[0] = key
         await emit("results", ResultsEvent(
-            results=[
-                _result_payload(doc, score, ctx.source_by_url.get(doc.url, ""), "final")
-                for doc, score in ranked
-            ],
+            results=[_result_payload(doc, score, "", "final") for doc, score in ranked],
             count=len(ranked),
         ))
 
@@ -613,65 +467,10 @@ async def _index_results(query: str, docs: list[Document]) -> int:
         return 0
 
 
-def _enqueue_discovered_urls(ctx: SelectionContext) -> None:
-    """Queue every URL Super Search discovered for organic crawling.
-
-    Tags each FoundURL with its originating source name in the user_id_hash slot
-    (consistent with the 'hn' seed precedent), so descendant pages crawled later
-    can inherit the source via SourceProvenance. Blocking (Redis + Postgres);
-    run off the event loop. Never raises into the caller.
-    """
-    now = datetime.utcnow()
-    found_urls = [
-        FoundURL(url, source, URLStatus.NEW, now, last_crawled=None)
-        for url, source in ctx.source_by_url.items()
-    ]
-    if found_urls:
-        _add_found_urls_to_db_and_queue(found_urls, queued_batches)
-
-
-async def _record_rewards(ctx: SelectionContext, last_results_key: list) -> None:
-    """Compute per-source rewards and log the impression.
-
-    Preferred reward: mean relevance-judge score of each source's final-pool
-    documents (recorded by the judged final re-rank). Fallback when the judge
-    is unavailable: fraction of a source's results surviving the final top-K.
-    """
-    if not ctx.selected:
-        return
-    rewards = compute_judge_rewards(ctx)
-    if rewards is None:
-        final_urls = list(last_results_key[0] or ())
-        top_k = getattr(settings, "SUPER_SEARCH_TOP_K", 10)
-        rewards = compute_rewards(ctx, final_urls[:top_k])
-    try:
-        await asyncio.to_thread(log_impression, ctx, rewards)
-    except Exception:
-        logger.exception("super-search failed to record rewards")
-    try:
-        # Per-source reward EMA: the online stat behind the contribution_ema
-        # feature (aggregate per source, nothing query-derived). Together with
-        # the impression log this is the policy's whole update — the xgb model
-        # itself retrains in batch.
-        await asyncio.to_thread(ss_rstats.update, rewards)
-    except Exception:
-        logger.exception("super-search failed to update reward stats")
-    try:
-        await asyncio.to_thread(record_source_provenance, ctx)
-    except Exception:
-        logger.exception("super-search failed to record source provenance")
-    try:
-        await asyncio.to_thread(_enqueue_discovered_urls, ctx)
-    except Exception:
-        logger.exception("super-search failed to enqueue discovered urls")
-
-
 async def _run_pipeline(
-    query: str, emit, all_docs: list[Document], last_results_key: list, lock: asyncio.Lock,
-    ctx: SelectionContext, judge_worker: "_JudgeWorker | None" = None,
+    query: str, emit, all_docs: list[Document], last_results_key: list, lock: asyncio.Lock
 ) -> None:
     per_source_limit = settings.SUPER_SEARCH_RESULTS_PER_SOURCE
-    ctx.per_source_limit = per_source_limit
     top_k = getattr(settings, "SUPER_SEARCH_TOP_K", 10)
     limits = httpx.Limits(max_connections=20, max_keepalive_connections=10)
     timeout = httpx.Timeout(settings.SUPER_SEARCH_PER_SOURCE_TIMEOUT)
@@ -703,20 +502,11 @@ async def _run_pipeline(
         follow_redirects=True,
         headers={"User-Agent": HTTP_USER_AGENT},
     ) as client:
-        # Select a subset of sources to query (xgb contextual-bandit policy)
-        # rather than fanning out to every registered source.
-        sources_to_query = getattr(settings, "SUPER_SEARCH_SOURCES_TO_QUERY", len(SOURCES))
-        ctx.candidates = list(SOURCES.keys())
-        selected = await asyncio.to_thread(
-            select_sources, query, ctx.candidates, sources_to_query, ctx
-        )
-        ctx.selected = selected
-
         source_tasks = []
-        for name in selected:
+        for name, fn in SOURCES.items():
             await emit("source_started", SourceStartedEvent(source=name))
             source_tasks.append(
-                asyncio.create_task(_call_source(name, SOURCES[name], client, query, per_source_limit))
+                asyncio.create_task(_call_source(name, fn, client, query, per_source_limit))
             )
 
         secondary: list[asyncio.Task] = []
@@ -730,12 +520,6 @@ async def _run_pipeline(
             if not docs:
                 continue
 
-            # Fold this source's results into its decaying-mean content profile
-            # (best-effort; tracked in `secondary` so failures are logged at gather).
-            secondary.append(asyncio.create_task(_update_profile(name, docs)))
-            # Remember which source produced each URL, for reward attribution.
-            ctx.record_results(name, [d.url for d in docs if d.url])
-
             scores = await asyncio.to_thread(_heuristic_score_docs, query, docs)
             for doc, score in zip(docs, scores):
                 if doc.url and doc.title:
@@ -743,11 +527,10 @@ async def _run_pipeline(
                 if _maybe_promote(doc, score):
                     await emit("result_promoted", _result_payload(doc, score, name, "direct"))
                     secondary.append(
-                        asyncio.create_task(_follow_links(doc, query, emit, all_docs, last_results_key, lock, ctx, judge_worker))
+                        asyncio.create_task(_follow_links(doc, query, emit, all_docs, last_results_key, lock))
                     )
             if all_docs:
-                await _emit_final_results(query, all_docs, emit, last_results_key, lock, ctx,
-                                          judge_worker=judge_worker)
+                await _emit_final_results(query, all_docs, emit, last_results_key, lock)
 
         if secondary:
             results = await asyncio.gather(*secondary, return_exceptions=True)
@@ -768,11 +551,6 @@ async def _sse_stream(query: str, monthly_usage: int, monthly_limit: int):
     all_docs: list[Document] = []
     last_results_key: list = [None]
     results_lock = asyncio.Lock()
-    selection_ctx = SelectionContext()
-    # Created here rather than in _run_pipeline so the deadline's wait_for
-    # cannot cancel it: on timeout the accumulated scores survive and the
-    # judged final frame only has stragglers left to score.
-    judge_worker = _JudgeWorker(query, selection_ctx)
 
     async def emit(event_type: str, data: Any) -> None:
         await queue.put((event_type, data))
@@ -781,8 +559,7 @@ async def _sse_stream(query: str, monthly_usage: int, monthly_limit: int):
         nonlocal reason, pages_indexed
         try:
             await asyncio.wait_for(
-                _run_pipeline(query, emit, all_docs, last_results_key, results_lock, selection_ctx,
-                              judge_worker),
+                _run_pipeline(query, emit, all_docs, last_results_key, results_lock),
                 timeout=settings.SUPER_SEARCH_DEADLINE_SECONDS,
             )
         except asyncio.TimeoutError:
@@ -795,19 +572,13 @@ async def _sse_stream(query: str, monthly_usage: int, monthly_limit: int):
             reason = "error"
             await queue.put(("error", ErrorEvent(message=str(e))))
         finally:
-            try:
-                if reason in ("complete", "timed_out"):
-                    try:
-                        await _emit_final_results(query, all_docs, emit, last_results_key,
-                                                  results_lock, selection_ctx, use_judge=True,
-                                                  judge_worker=judge_worker)
-                    except Exception:
-                        logger.exception("super-search failed to emit final results")
-                    pages_indexed = await _index_results(query, all_docs)
-                    await _record_rewards(selection_ctx, last_results_key)
-            finally:
-                await judge_worker.aclose()
-                await queue.put(_SENTINEL)
+            if reason in ("complete", "timed_out"):
+                try:
+                    await _emit_final_results(query, all_docs, emit, last_results_key, results_lock)
+                except Exception:
+                    logger.exception("super-search failed to emit final results")
+                pages_indexed = await _index_results(query, all_docs)
+            await queue.put(_SENTINEL)
 
     task = asyncio.create_task(producer())
 
@@ -837,7 +608,6 @@ async def _sse_stream(query: str, monthly_usage: int, monthly_limit: int):
                 await task
             except (asyncio.CancelledError, Exception):
                 pass
-        await judge_worker.aclose()
 
 
 # ---------------------------------------------------------------------------
@@ -872,7 +642,7 @@ def init_router() -> None:
             "| `result_promoted` | result item (`origin=\"direct\"`) | A result entered the live top-K and will have its outbound links followed. |\n"
             "| `page_fetched` | `{url, links}` | A promoted page was crawled; `links` is the number of outbound links found. |\n"
             "| `link_followed` | `{url, from}` | An outbound link from a crawled page was fetched and added to the candidate pool. |\n"
-            "| `results` | `{results[], count}` | The current authoritative ranking (items have `origin=\"final\"`). Emitted progressively after each source and once more at the end; the end-of-search frame is re-ranked by the fine-tuned relevance judge when available — **replace** your displayed list on each. |\n"
+            "| `results` | `{results[], count}` | The current authoritative ranking (items have `origin=\"final\"`). Emitted progressively after each source and once more at the end — **replace** your displayed list on each. |\n"
             "| `error` | `{message}` | The pipeline crashed; the stream ends. |\n"
             "| `done` | `{reason, elapsed_seconds, monthly_usage, monthly_limit, pages_indexed}` | Terminal event. `reason` is `complete`, `timed_out`, `cancelled` or `error`; `pages_indexed` is the number of new pages added to the Mwmbl index by this search. |\n\n"
             "The exact JSON shape of every payload is given by the `oneOf` schema "

@@ -67,7 +67,7 @@ class MwmblConfig(AppConfig):
 
         try:
             from background_task.models import Task
-            from mwmbl.background import retrain_super_search_xgb, sync_search_counts
+            from mwmbl.background import sync_search_counts
 
             SYNC_TASK = "mwmbl.background.sync_search_counts"
 
@@ -75,21 +75,6 @@ class MwmblConfig(AppConfig):
             if not Task.objects.filter(task_name=SYNC_TASK).exists():
                 sync_search_counts(repeat=3600, repeat_until=None)
 
-            # Retrain the Super Search xgb source model daily from the
-            # impression log (skips until enough pairs have accumulated).
-            XGB_TASK = "mwmbl.background.retrain_super_search_xgb"
-            if not Task.objects.filter(task_name=XGB_TASK).exists():
-                retrain_super_search_xgb(repeat=86400, repeat_until=None)
-
         except Exception:
             # Don't prevent startup if background task scheduling fails
             log.exception("Failed to schedule background tasks")
-
-        try:
-            # SETNX-seed Redis content profiles + reward EMAs from the bundled
-            # xgb artifact so serving features match training from the first
-            # request (and a Redis wipe self-heals on next startup).
-            from mwmbl.tinysearchengine.super_search_select import xgb_model
-            xgb_model.seed_online_state()
-        except Exception:
-            log.exception("Failed to seed super-search online state")
