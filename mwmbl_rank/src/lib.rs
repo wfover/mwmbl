@@ -91,16 +91,19 @@ impl PyXGBPipeline {
     /// Args:
     ///     records: list of dicts with keys query, url, title, extract, score
     ///     labels: list of float relevance labels
+    ///     sample_weight: optional list of per-row weights (default: equal weights)
     ///
     /// Returns self (for chaining).
+    #[pyo3(signature = (records, labels, sample_weight=None))]
     fn fit(
         &mut self,
         py: Python<'_>,
         records: &Bound<'_, PyAny>,
         labels: Vec<f32>,
+        sample_weight: Option<Vec<f32>>,
     ) -> PyResult<PyObject> {
         let doc_records = self.extract_records(records)?;
-        self.inner.fit(&doc_records, &labels)
+        self.inner.fit(&doc_records, &labels, sample_weight.as_deref())
             .map_err(|e| PyValueError::new_err(e))?;
         // Return self as a Python object for sklearn-style chaining
         Ok(py.None())

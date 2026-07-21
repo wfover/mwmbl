@@ -271,6 +271,8 @@ POLAR_PRODUCT_ID_STARTER = os.environ.get("POLAR_PRODUCT_ID_STARTER", "")
 POLAR_PRODUCT_ID_PRO = os.environ.get("POLAR_PRODUCT_ID_PRO", "")
 POLAR_SERVER = os.environ.get("POLAR_SERVER", "sandbox")
 
+GUARDIAN_API_KEY = os.environ.get("GUARDIAN_API_KEY", "")
+
 CURRENT_AGREEMENT_VERSIONS = {
     "TERMS_OF_SERVICE_GUI": "v2026-04-A",
     "TERMS_OF_SERVICE_API": "v2026-04-A",
@@ -286,3 +288,28 @@ SUPER_SEARCH_MAX_LINKS_PER_PAGE = 3
 SUPER_SEARCH_RESULTS_PER_SOURCE = 10
 SUPER_SEARCH_FINAL_RESULTS_LIMIT = 100
 SUPER_SEARCH_CRAWL_WORKERS = 8   # threads in the dedicated crawl pool
+# Fine-tuned relevance judge (dir with model.onnx + tokenizer.json; see
+# devdata/judge_train/RESULTS.md). If the artifact is missing, Super Search
+# falls back to LTR final ranking and top-K-survival bandit rewards.
+SUPER_SEARCH_JUDGE_MODEL_DIR = os.environ.get(
+    "SUPER_SEARCH_JUDGE_MODEL_DIR",
+    str(Path(__file__).parent.parent / "devdata" / "judge_train" / "models"
+        / "minilm-both-v1" / "onnx"))
+
+# Super Search source selection (xgb contextual bandit over cosine-profile features)
+SUPER_SEARCH_SOURCES_TO_QUERY = 10   # max sources queried per search
+SUPER_SEARCH_PROJECTION_DIM = 64     # feature-hashing / random-projection dimension
+SUPER_SEARCH_PROFILE_DECAY = 0.1     # decaying-mean weight for per-site content profiles
+SUPER_SEARCH_QVEC_CACHE_TTL = 3600   # seconds to cache a query's projected vectors
+SUPER_SEARCH_FORCE_INCLUDE = []      # source names always queried (high-value sources), like always_on
+
+# XGBoost contextual-bandit source model. The runtime dir receives online
+# retrains (background task); before the first retrain, serving uses the
+# repo-bundled warm-start artifact in super_search_select/artifacts/xgb.
+SUPER_SEARCH_XGB_MODEL_DIR = os.environ.get(
+    "SUPER_SEARCH_XGB_MODEL_DIR",
+    str(Path(__file__).parent.parent / "devdata" / "super_search_xgb"))
+SUPER_SEARCH_XGB_EPSILON = 0.1            # epsilon-greedy exploration rate
+SUPER_SEARCH_XGB_MIN_TRAIN_ROWS = 2000    # (source, reward) pairs required before an online retrain
+SUPER_SEARCH_XGB_TRAIN_WINDOW_DAYS = 90   # impression window for online retrains
+SOURCE_PROVENANCE_MAX_DEPTH = 3      # max crawl hops a Super Search source propagates to descendant pages

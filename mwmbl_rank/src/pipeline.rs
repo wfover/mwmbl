@@ -129,7 +129,13 @@ impl XGBPipeline {
     ///
     /// `records`: list of document records (query + document fields)
     /// `labels`: relevance labels (float); binarised at `self.threshold` before training
-    pub fn fit(&mut self, records: &[DocumentRecord], labels: &[f32]) -> Result<(), String> {
+    /// `weights`: optional per-row sample weights (default: all rows weighted equally)
+    pub fn fit(
+        &mut self,
+        records: &[DocumentRecord],
+        labels: &[f32],
+        weights: Option<&[f32]>,
+    ) -> Result<(), String> {
         use std::time::Instant;
 
         eprintln!("[XGBPipeline::fit] Starting fit() with {} records", records.len());
@@ -143,6 +149,15 @@ impl XGBPipeline {
                 records.len(),
                 labels.len()
             ));
+        }
+        if let Some(w) = weights {
+            if w.len() != records.len() {
+                return Err(format!(
+                    "weights length ({}) != records length ({})",
+                    w.len(),
+                    records.len()
+                ));
+            }
         }
 
         // Binarise labels at threshold (ThresholdPredictor logic)
@@ -171,6 +186,10 @@ impl XGBPipeline {
         let t3 = Instant::now();
         dmat.set_labels(&binary_labels)
             .map_err(|e| format!("Failed to set labels: {}", e))?;
+        if let Some(w) = weights {
+            dmat.set_weights(w)
+                .map_err(|e| format!("Failed to set weights: {}", e))?;
+        }
         eprintln!("[XGBPipeline::fit] DMatrix::set_labels done in {:.2?}", t3.elapsed());
 
         // Build learning parameters (objective: binary:logistic)
@@ -333,7 +352,7 @@ mod tests {
         let labels: Vec<f32> = (0..20).map(|i| if i % 2 == 0 { 1.0 } else { 0.0 }).collect();
 
         let mut pipeline = XGBPipeline::new(0.0, 0.1, 2.0, 10);
-        pipeline.fit(&records, &labels).expect("fit should succeed");
+        pipeline.fit(&records, &labels, None).expect("fit should succeed");
 
         let preds = pipeline.predict(&records).expect("predict should succeed");
         assert_eq!(preds.len(), 20);
@@ -350,7 +369,7 @@ mod tests {
         let records = make_records(20);
         let labels: Vec<f32> = vec![1.0; 20];
         let mut pipeline = XGBPipeline::new(0.0, 0.1, 2.0, 10);
-        pipeline.fit(&records, &labels).expect("fit should succeed");
+        pipeline.fit(&records, &labels, None).expect("fit should succeed");
 
         let test = vec![
             // Matches both query terms ("rust programming") -> kept.
@@ -378,6 +397,40 @@ mod tests {
     }
 
     #[test]
+    fn test_fit_with_weights() {
+        let records = make_records(20);
+        let labels: Vec<f32> = (0..20).map(|i| if i % 2 == 0 { 1.0 } else { 0.0 }).collect();
+
+        // Equal explicit weights must reproduce the unweighted model exactly.
+        let mut unweighted = XGBPipeline::new(0.0, 0.1, 2.0, 10);
+        unweighted.fit(&records, &labels, None).expect("fit should succeed");
+        let mut weighted = XGBPipeline::new(0.0, 0.1, 2.0, 10);
+        weighted.fit(&records, &labels, Some(&vec![1.0; 20])).expect("fit should succeed");
+        let base = unweighted.predict(&records).expect("predict should succeed");
+        let same = weighted.predict(&records).expect("predict should succeed");
+        assert_eq!(base, same, "weight=1.0 for every row must match unweighted training");
+
+        // Near-zero weight on all negative rows must push predictions up.
+        let skew: Vec<f32> = labels.iter().map(|&l| if l > 0.0 { 1.0 } else { 1e-3 }).collect();
+        let mut skewed = XGBPipeline::new(0.0, 0.1, 2.0, 10);
+        skewed.fit(&records, &labels, Some(&skew)).expect("fit should succeed");
+        let up = skewed.predict(&records).expect("predict should succeed");
+        let mean = |v: &[f32]| v.iter().sum::<f32>() / v.len() as f32;
+        assert!(mean(&up) > mean(&base),
+            "down-weighting negatives should raise mean prediction ({} vs {})",
+            mean(&up), mean(&base));
+    }
+
+    #[test]
+    fn test_fit_rejects_mismatched_weights() {
+        let records = make_records(10);
+        let labels = vec![1.0; 10];
+        let mut pipeline = XGBPipeline::new(0.0, 0.1, 2.0, 5);
+        let result = pipeline.fit(&records, &labels, Some(&vec![1.0; 3]));
+        assert!(result.is_err());
+    }
+
+    #[test]
     fn test_pipeline_predict_without_fit() {
         let records = make_records(5);
         let pipeline = XGBPipeline::new(0.0, 0.1, 2.0, 10);
@@ -390,7 +443,7 @@ mod tests {
         let records = make_records(10);
         let labels: Vec<f32> = vec![1.0; 10];
         let mut pipeline = XGBPipeline::new(0.0, 0.1, 2.0, 5);
-        pipeline.fit(&records, &labels).expect("fit should succeed");
+        pipeline.fit(&records, &labels, None).expect("fit should succeed");
 
         let preds = pipeline.predict(&[]).expect("empty predict should succeed");
         assert_eq!(preds.len(), 0);

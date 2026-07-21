@@ -188,9 +188,29 @@ scripts/downloads/
 
 # Super Search candidate classification intermediates
 candidate_chunks/
+recipe_chunks/
+
+# Super Search data artifacts (inputs/outputs of scripts/, not source)
+curated-domains.json
+super-search-targets.json
+prescreen.json
+devdata/ss_eval_matrix*
+devdata/ss_gold_matrix*
+devdata/ss_judge_matrix*
+devdata/ss_judge_queries.txt
+devdata/super_search_xgb/
 
 # AI planning documents
 plans/
 
 # Claude Code configuration
 .claude/
+devdata/llm_relabel/pass3_manifest_*.jsonl
+
+# Relevance judge artifacts (small results*.json stay tracked via explicit add)
+devdata/judge_bakeoff/*.npy
+devdata/judge_bakeoff/*.npz
+devdata/judgments_export/
+devdata/judge_train/*
+!devdata/judge_train/RESULTS.md
+!devdata/judge_train/eval_manifest.json
